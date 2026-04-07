@@ -1,0 +1,80 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sliderag"
+version = "0.1.0"
+authors = [
+    {name = ""}
+]
+description = "SlideRAG: document parsing and RAG runtime toolkit"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "huggingface_hub",
+    "lightrag-hku",
+    "mineru[core]",
+    "tqdm",
+    "anthropic",
+    "openai",
+    "streamlit",
+    "loguru",
+    "Pillow>=10.0.0",
+    "reportlab>=4.0.0",
+    "markdown>=3.4.0",
+    "weasyprint>=60.0",
+    "pygments>=2.10.0",
+]
+
+[project.scripts]
+sliderag-qq = "client.qq_runtime:main"
+sliderag-weixin = "client.weixin_runtime:main"
+
+[project.optional-dependencies]
+qq = ["qq-botpy"]
+weixin = [
+    "httpx",
+    "qrcode[pil]",
+]
+channels = [
+    "qq-botpy",
+    "httpx",
+    "qrcode[pil]",
+]
+
+[project.urls]
+Homepage = "https://github.com/Hitlh/SlideRAG"
+Documentation = "https://github.com/Hitlh/SlideRAG/blob/main/README.md"
+Repository = "https://github.com/Hitlh/SlideRAG"
+Issues = "https://github.com/Hitlh/SlideRAG/issues"
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=6.0",
+    "pytest-asyncio",
+    "black",
+    "isort",
+    "flake8",
+    "mypy",
+    "openai",
+    "python-dotenv",
+]
+
+[tool.setuptools.packages.find]
+include = ["raganything*", "rag_agent*", "client*"]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.ruff]
+target-version = "py310"

@@ -1,0 +1,23 @@
+include requirements.txt
+include README.md
+include README_zh.md
+include LICENSE
+include env.project.example
+
+graft raganything
+graft rag_agent
+graft client
+graft assets
+graft scripts
+graft tests
+
+prune output
+prune uploaded_docs
+prune rag_storage_by_file
+
+global-exclude *.pyc
+global-exclude __pycache__
+global-exclude *.egg-info
+global-exclude *.pyo
+global-exclude *.pyd
+global-exclude .DS_Store

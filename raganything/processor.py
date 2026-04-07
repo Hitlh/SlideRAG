@@ -1,0 +1,3239 @@
+"""
+Document processing functionality for RAGAnything
+
+Contains methods for parsing documents and processing multimodal content
+"""
+
+import os
+import time
+import hashlib
+import json
+import inspect
+import numpy as np
+import re
+from typing import Dict, List, Any, Tuple, Optional
+from pathlib import Path
+
+from raganything.base import DocStatus
+from raganything.parser import MineruParser, DoclingParser, MineruExecutionError
+from raganything.prompt import PROMPTS
+from raganything.utils import (
+    separate_content,
+    insert_text_content,
+    insert_text_content_with_multimodal_content,
+    get_processor_for_type,
+    encode_image_to_base64,
+)
+import asyncio
+from lightrag.utils import compute_mdhash_id
+from lightrag.constants import GRAPH_FIELD_SEP
+
+
+class ProcessorMixin:
+    """ProcessorMixin class containing document processing functionality for RAGAnything"""
+
+    def _get_file_reference(self, file_path: str) -> str:
+        """
+        Get file reference based on use_full_path configuration.
+
+        Args:
+            file_path: Path to the file (can be absolute or relative)
+
+        Returns:
+            str: Full path if use_full_path is True, otherwise basename
+        """
+        if self.config.use_full_path:
+            return str(file_path)
+        else:
+            return os.path.basename(file_path)
+
+    def _generate_cache_key(
+        self, file_path: Path, parse_method: str = None, **kwargs
+    ) -> str:
+        """
+        Generate cache key based on file path and parsing configuration
+
+        Args:
+            file_path: Path to the file
+            parse_method: Parse method used
+            **kwargs: Additional parser parameters
+
+        Returns:
+            str: Cache key for the file and configuration
+        """
+
+        # Get file modification time
+        mtime = file_path.stat().st_mtime
+
+        # Create configuration dict for cache key
+        config_dict = {
+            "file_path": str(file_path.absolute()),
+            "mtime": mtime,
+            "parser": self.config.parser,
+            "parse_method": parse_method or self.config.parse_method,
+        }
+
+        # Add relevant kwargs to config
+        relevant_kwargs = {
+            k: v
+            for k, v in kwargs.items()
+            if k
+            in [
+                "lang",
+                "device",
+                "start_page",
+                "end_page",
+                "formula",
+                "table",
+                "backend",
+                "source",
+            ]
+        }
+        config_dict.update(relevant_kwargs)
+
+        # Generate hash from config
+        config_str = json.dumps(config_dict, sort_keys=True)
+        cache_key = hashlib.md5(config_str.encode()).hexdigest()
+
+        return cache_key
+
+    def _generate_content_based_doc_id(self, content_list: List[Dict[str, Any]]) -> str:
+        """
+        Generate doc_id based on document content
+
+        Args:
+            content_list: Parsed content list
+
+        Returns:
+            str: Content-based document ID with doc- prefix
+        """
+        from lightrag.utils import compute_mdhash_id
+
+        # Extract key content for ID generation
+        content_hash_data = []
+
+        for item in content_list:
+            if isinstance(item, dict):
+                # For text content, use the text
+                if item.get("type") == "text" and item.get("text"):
+                    content_hash_data.append(item["text"].strip())
+                # For other content types, use key identifiers
+                elif item.get("type") == "image" and item.get("img_path"):
+                    content_hash_data.append(f"image:{item['img_path']}")
+                elif item.get("type") == "table" and item.get("table_body"):
+                    content_hash_data.append(f"table:{item['table_body']}")
+                elif item.get("type") == "equation" and item.get("text"):
+                    content_hash_data.append(f"equation:{item['text']}")
+                else:
+                    # For other types, use string representation
+                    content_hash_data.append(str(item))
+
+        # Create a content signature
+        content_signature = "\n".join(content_hash_data)
+
+        # Generate doc_id from content
+        doc_id = compute_mdhash_id(content_signature, prefix="doc-")
+
+        return doc_id
+
+    def _resolve_summary_language(self) -> str:
+        """Resolve summary language from SUMMARY_LANGUAGE env var."""
+        raw = str(os.getenv("SUMMARY_LANGUAGE", "English") or "").strip().lower()
+        if raw in {"en", "eng", "english"}:
+            return "English"
+        return "Chinese"
+
+    def _generate_page_topics_cache_key(
+        self,
+        content_list: List[Dict[str, Any]],
+        use_llm: bool,
+        max_chars: int,
+        summary_language: str,
+    ) -> str:
+        """
+        Generate cache key for page topics based on content and parameters.
+
+        Args:
+            content_list: Parsed content list
+            use_llm: Whether LLM-based topic extraction is enabled
+            max_chars: Max characters used for LLM prompt
+
+        Returns:
+            str: Cache key hash
+        """
+        doc_id = self._generate_content_based_doc_id(content_list)
+        cache_data = {
+            "doc_id": doc_id,
+            "use_llm": bool(use_llm),
+            "max_chars": int(max_chars),
+            "summary_language": str(summary_language),
+        }
+        cache_str = json.dumps(cache_data, sort_keys=True, ensure_ascii=False)
+        return hashlib.md5(cache_str.encode()).hexdigest()
+
+    async def _get_cached_hidden_expand(
+        self,
+        cache_key: str,
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]] | None:
+        """
+        Get cached hidden-information expansion result if available and valid.
+
+        Returns:
+            Tuple[List[Dict[str, Any]], Dict[str, Any]] | None
+        """
+        if not hasattr(self, "hidden_expand_cache") or self.hidden_expand_cache is None:
+            return None
+
+        try:
+            cached_data = await self.hidden_expand_cache.get_by_id(cache_key)
+            if not cached_data:
+                return None
+            enriched_content = cached_data.get("enriched_content")
+            hidden_expand_report = cached_data.get("hidden_expand_report")
+            if isinstance(enriched_content, list) and isinstance(
+                hidden_expand_report, dict
+            ):
+                self.logger.debug(
+                    f"Found valid cached hidden expansion for key: {cache_key}"
+                )
+                return enriched_content, hidden_expand_report
+
+            self.logger.debug(
+                f"Hidden expansion cache incomplete - missing content/report: {cache_key}"
+            )
+            return None
+        except Exception as e:
+            self.logger.warning(f"Error accessing hidden expansion cache: {e}")
+            return None
+
+    async def _store_cached_hidden_expand(
+        self,
+        cache_key: str,
+        enriched_content: List[Dict[str, Any]],
+        hidden_expand_report: Dict[str, Any],
+    ) -> None:
+        """Store hidden-information expansion result in cache."""
+        if not hasattr(self, "hidden_expand_cache") or self.hidden_expand_cache is None:
+            return
+
+        try:
+            cache_data = {
+                cache_key: {
+                    "enriched_content": enriched_content,
+                    "hidden_expand_report": hidden_expand_report,
+                    "cached_at": time.time(),
+                    "cache_version": "1.0",
+                }
+            }
+            await self.hidden_expand_cache.upsert(cache_data)
+            await self.hidden_expand_cache.index_done_callback()
+            self.logger.info(f"Stored hidden expansion in cache: {cache_key}")
+        except Exception as e:
+            self.logger.warning(f"Error storing hidden expansion to cache: {e}")
+
+    async def _get_cached_page_topics(
+        self,
+        cache_key: str,
+        content_list: List[Dict[str, Any]],
+        use_llm: bool,
+        max_chars: int,
+        summary_language: str,
+    ) -> Dict[int, str] | None:
+        """
+        Get cached page topics if available and valid.
+
+        Returns:
+            Dict[int, str] | None: page topics dict or None if invalid/missing
+        """
+        if not hasattr(self, "page_topics_cache") or self.page_topics_cache is None:
+            return None
+
+        try:
+            cached_data = await self.page_topics_cache.get_by_id(cache_key)
+            if not cached_data:
+                return None
+
+            current_doc_id = self._generate_content_based_doc_id(content_list)
+            cached_doc_id = cached_data.get("doc_id")
+            if cached_doc_id != current_doc_id:
+                self.logger.debug(f"Page topics cache invalid - doc changed: {cache_key}")
+                return None
+
+            cached_config = cached_data.get("topic_config", {})
+            current_config = {
+                "use_llm": bool(use_llm),
+                "max_chars": int(max_chars),
+                "summary_language": str(summary_language),
+            }
+
+            if cached_config != current_config:
+                self.logger.debug(
+                    f"Page topics cache invalid - config changed: {cache_key}"
+                )
+                return None
+
+            page_topics = cached_data.get("page_topics")
+            if isinstance(page_topics, dict) and page_topics:
+                self.logger.debug(
+                    f"Found valid cached page topics for key: {cache_key}"
+                )
+                return page_topics
+
+            self.logger.debug(
+                f"Page topics cache incomplete - missing page_topics: {cache_key}"
+            )
+            return None
+
+        except Exception as e:
+            self.logger.warning(f"Error accessing page topics cache: {e}")
+            return None
+
+    async def _store_cached_page_topics(
+        self,
+        cache_key: str,
+        content_list: List[Dict[str, Any]],
+        page_topics: Dict[int, str],
+        use_llm: bool,
+        max_chars: int,
+        summary_language: str,
+    ) -> None:
+        """
+        Store page topics in cache.
+        """
+        if not hasattr(self, "page_topics_cache") or self.page_topics_cache is None:
+            return
+
+        try:
+            doc_id = self._generate_content_based_doc_id(content_list)
+            cache_data = {
+                cache_key: {
+                    "doc_id": doc_id,
+                    "page_topics": page_topics,
+                    "topic_config": {
+                        "use_llm": bool(use_llm),
+                        "max_chars": int(max_chars),
+                        "summary_language": str(summary_language),
+                    },
+                    "cached_at": time.time(),
+                    "cache_version": "1.0",
+                }
+            }
+            await self.page_topics_cache.upsert(cache_data)
+            await self.page_topics_cache.index_done_callback()
+            self.logger.info(f"Stored page topics in cache: {cache_key}")
+        except Exception as e:
+            self.logger.warning(f"Error storing page topics to cache: {e}")
+
+    async def _call_llm_model(
+        self, prompt: str, system_prompt: str | None = None
+    ) -> str:
+        """Safely call llm_model_func regardless of sync/async signature."""
+        if not hasattr(self, "llm_model_func") or self.llm_model_func is None:
+            raise RuntimeError("llm_model_func is required for LLM-based extraction")
+
+        fn = self.llm_model_func
+
+        print("Calling LLM model function...")
+
+        # Some callables do not accept history_messages, so try graceful fallbacks
+        async def _invoke(with_history: bool):
+            if inspect.iscoroutinefunction(fn):
+                if with_history:
+                    return await fn(
+                        prompt,
+                        system_prompt=system_prompt,
+                        history_messages=[],
+                    )
+                return await fn(prompt, system_prompt=system_prompt)
+
+            result = (
+                fn(
+                    prompt,
+                    system_prompt=system_prompt,
+                    history_messages=[],
+                )
+                if with_history
+                else fn(prompt, system_prompt=system_prompt)
+            )
+
+            if asyncio.iscoroutine(result):
+                return await result
+            return result
+
+        try:
+            return await _invoke(with_history=True)
+        except TypeError:
+            return await _invoke(with_history=False)
+
+    def _parse_page_topic_response(self, response: str, fallback_topic: str) -> str:
+        """Parse LLM response and extract topic text."""
+        if not response:
+            return fallback_topic
+
+        cleaned = str(response).strip()
+        json_candidate = cleaned
+
+        # Try direct JSON parse
+        parsed = None
+        try:
+            parsed = json.loads(json_candidate)
+        except json.JSONDecodeError:
+            start = cleaned.find("{")
+            end = cleaned.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                try:
+                    parsed = json.loads(cleaned[start : end + 1])
+                except Exception:
+                    parsed = None
+
+        if isinstance(parsed, dict):
+            topic_value = parsed.get("topic") or parsed.get("title") or parsed.get(
+                "entity"
+            )
+            if isinstance(topic_value, str) and topic_value.strip():
+                return topic_value.strip()
+
+        first_line = cleaned.splitlines()[0].strip()
+        return first_line if first_line else fallback_topic
+
+    async def _call_vision_model(
+        self, prompt: str, system_prompt: str | None, image_data: str
+    ) -> str:
+        """Safely call vision_model_func if available."""
+        fn = getattr(self, "vision_model_func", None)
+        if fn is None:
+            raise RuntimeError("vision_model_func is required for image understanding")
+
+        if inspect.iscoroutinefunction(fn):
+            return await fn(
+                prompt,
+                system_prompt=system_prompt,
+                image_data=image_data,
+            )
+
+        result = fn(
+            prompt,
+            system_prompt=system_prompt,
+            image_data=image_data,
+        )
+        if asyncio.iscoroutine(result):
+            return await result
+        return result
+
+    async def _describe_image_for_topic(
+        self,
+        image_item: Dict[str, Any],
+        page_context: str,
+        summary_language: str,
+    ) -> str:
+        """Generate a short description for an image using the vision model with page context."""
+        if not isinstance(image_item, dict):
+            return ""
+
+        img_path = image_item.get("img_path")
+        if not img_path:
+            return ""
+
+        image_b64 = encode_image_to_base64(img_path)
+        if not image_b64:
+            return ""
+
+        ctx = (page_context or "").strip()
+        ctx_snippet = ctx[:500]  # keep prompt compact
+
+        if str(summary_language).lower() == "english":
+            prompt = (
+                "Using the page text context below, summarize the main content of this slide image "
+                "in one short English sentence. Output plain text only.\n"
+                f"Context: {ctx_snippet}"
+            )
+        else:
+            prompt = (
+                "请结合下方页面文字上下文，用一句中文短句概括这张幻灯片图片的主要内容，输出纯文本。\n"
+                f"上下文：{ctx_snippet}"
+            )
+
+        try:
+            response = await self._call_vision_model(
+                prompt,
+                system_prompt=PROMPTS.get("IMAGE_ANALYSIS_SYSTEM"),
+                image_data=image_b64,
+            )
+            return str(response).strip()
+        except Exception as e:
+            self.logger.debug(
+                f"Vision model description failed for image {img_path}: {e}"
+            )
+            return ""
+
+    def _build_hidden_info_page_buckets(
+        self, content_list: List[Dict[str, Any]]
+    ) -> Dict[int, List[Tuple[int, Dict[str, Any]]]]:
+        """Group content blocks by page while preserving source block index."""
+        page_buckets: Dict[int, List[Tuple[int, Dict[str, Any]]]] = {}
+        for idx, item in enumerate(content_list):
+            if not isinstance(item, dict):
+                continue
+            page_idx = item.get("page_idx")
+            if page_idx is None:
+                continue
+            try:
+                page_key = int(page_idx)
+            except (TypeError, ValueError):
+                continue
+            page_buckets.setdefault(page_key, []).append((idx, item))
+        return page_buckets
+
+    def _compute_hidden_info_features(
+        self, page_items: List[Tuple[int, Dict[str, Any]]]
+    ) -> Dict[str, float]:
+        """Compute page-level hidden-information features with values in [0, 1]."""
+        text_units: List[str] = []
+        list_item_lengths: List[int] = []
+        visual_count = 0
+
+        for _, item in page_items:
+            content_type = item.get("type")
+            if content_type in ["image", "table", "equation"]:
+                visual_count += 1
+
+            if content_type in ["text", "expanded_text"]:
+                text = item.get("text", "")
+                if isinstance(text, str) and text.strip():
+                    parts = [p.strip() for p in re.split(r"[\n.。；;!?！？]", text) if p.strip()]
+                    text_units.extend(parts if parts else [text.strip()])
+            elif content_type == "list" and item.get("sub_type") == "text":
+                list_items = item.get("list_items", [])
+                if isinstance(list_items, list):
+                    for li in list_items:
+                        if isinstance(li, str) and li.strip():
+                            clean_item = li.strip()
+                            text_units.append(clean_item)
+                            list_item_lengths.append(len(clean_item))
+
+        n_units = len(text_units)
+        if n_units == 0:
+            return {
+                "short_text_ratio": 0.0,
+                "bullet_density": 0.0,
+                "avg_item_len_low": 0.0,
+                "visual_text_gap": 0.0,
+                "hidden_score": 0.0,
+            }
+
+        short_threshold = 18
+        short_count = sum(1 for unit in text_units if len(unit) <= short_threshold)
+        short_text_ratio = short_count / n_units
+
+        list_count = len(list_item_lengths)
+        bullet_density = list_count / n_units
+        has_list_signal = list_count > 0
+
+        if list_count == 0:
+            avg_item_len_low = 0.0
+        else:
+            avg_list_len = sum(list_item_lengths) / list_count
+            avg_item_len_low = max(0.0, min(1.0, (24.0 - avg_list_len) / 24.0))
+
+        text_chars = sum(len(unit) for unit in text_units)
+        if visual_count == 0:
+            visual_text_gap = 0.0
+        else:
+            chars_per_visual = text_chars / max(visual_count, 1)
+            visual_text_gap = max(0.0, min(1.0, (180.0 - chars_per_visual) / 180.0))
+        has_visual_signal = visual_count > 0
+
+        # Adaptive weighting: only include features that are applicable on this page.
+        # This avoids unfair penalties when a page has no list blocks or no visual blocks.
+        base_weights = {
+            "bullet_density": 0.25,
+            "short_text_ratio": 0.35,
+            "avg_item_len_low": 0.20,
+            "visual_text_gap": 0.20,
+        }
+        feature_values = {
+            "bullet_density": bullet_density,
+            "short_text_ratio": short_text_ratio,
+            "avg_item_len_low": avg_item_len_low,
+            "visual_text_gap": visual_text_gap,
+        }
+        feature_available = {
+            "bullet_density": has_list_signal,
+            "short_text_ratio": True,
+            "avg_item_len_low": has_list_signal,
+            "visual_text_gap": has_visual_signal,
+        }
+
+        weighted_sum = 0.0
+        available_weight_sum = 0.0
+        total_weight = sum(base_weights.values())
+        for name, weight in base_weights.items():
+            if feature_available[name]:
+                weighted_sum += weight * feature_values[name]
+                available_weight_sum += weight
+
+        if available_weight_sum <= 0:
+            hidden_score = 0.0
+        else:
+            adaptive_score = weighted_sum / available_weight_sum
+            # Mild regularization: fewer available signals should be slightly conservative,
+            # but should not dominate the score.
+            availability_ratio = available_weight_sum / total_weight
+            hidden_score = adaptive_score * (0.75 + 0.25 * availability_ratio)
+            hidden_score = max(0.0, min(1.0, hidden_score))
+
+        return {
+            "short_text_ratio": float(short_text_ratio),
+            "bullet_density": float(bullet_density),
+            "avg_item_len_low": float(avg_item_len_low),
+            "visual_text_gap": float(visual_text_gap),
+            "feature_available": feature_available,
+            "hidden_score": float(hidden_score),
+        }
+
+    def detect_hidden_info_candidates(
+        self,
+        content_list: List[Dict[str, Any]],
+        score_threshold: float = 0.55,
+        max_items_per_page: int = 3,
+    ) -> List[Dict[str, Any]]:
+        """Detect likely hidden-information snippets using rule-based scoring."""
+        page_buckets = self._build_hidden_info_page_buckets(content_list)
+        results: List[Dict[str, Any]] = []
+
+        for page_idx in sorted(page_buckets.keys()):
+            page_items = page_buckets[page_idx]
+            feature_scores = self._compute_hidden_info_features(page_items)
+            hidden_score = feature_scores["hidden_score"]
+
+            if hidden_score < score_threshold:
+                continue
+
+            reason_values = {
+                "short_text_ratio": feature_scores["short_text_ratio"],
+                "bullet_density": feature_scores["bullet_density"],
+                "avg_item_len_low": feature_scores["avg_item_len_low"],
+                "visual_text_gap": feature_scores["visual_text_gap"],
+            }
+            feature_available = feature_scores.get("feature_available", {})
+            reasons = [
+                name
+                for name, _ in sorted(
+                    [
+                        (k, v)
+                        for k, v in reason_values.items()
+                        if feature_available.get(k, True)
+                    ],
+                    key=lambda kv: kv[1],
+                    reverse=True,
+                )[:3]
+            ]
+
+            candidates: List[Dict[str, Any]] = []
+            for block_idx, item in page_items:
+                content_type = item.get("type")
+
+                if content_type in ["text", "expanded_text"]:
+                    source_text = item.get("text", "")
+                    if isinstance(source_text, str) and source_text.strip():
+                        candidates.append(
+                            {
+                                "source_block_idx": int(block_idx),
+                                "source_text": source_text.strip(),
+                                "priority": max(
+                                    0.0,
+                                    min(1.0, (40.0 - len(source_text.strip())) / 40.0),
+                                ),
+                            }
+                        )
+                elif content_type == "list" and item.get("sub_type") == "text":
+                    list_items = item.get("list_items", [])
+                    if isinstance(list_items, list):
+                        joined = "\n".join(
+                            [x.strip() for x in list_items if isinstance(x, str) and x.strip()]
+                        )
+                        if joined.strip():
+                            candidates.append(
+                                {
+                                    "source_block_idx": int(block_idx),
+                                    "source_text": joined.strip(),
+                                    "priority": max(
+                                        0.0,
+                                        min(1.0, (40.0 - len(joined.strip())) / 40.0),
+                                    ),
+                                }
+                            )
+
+            # Prefer terse snippets and keep at most max_items_per_page.
+            candidates.sort(key=lambda x: x["priority"], reverse=True)
+            candidates = candidates[: max(1, int(max_items_per_page))]
+            if not candidates:
+                continue
+
+            results.append(
+                {
+                    "page_idx": page_idx,
+                    "hidden_score": hidden_score,
+                    "reasons": reasons,
+                    "features": feature_scores,
+                    "candidates": candidates,
+                }
+            )
+
+        return results
+
+    def _parse_hidden_expand_response(
+        self, response: str, fallback_text: str
+    ) -> Tuple[str, float]:
+        """Parse JSON response for hidden-information expansion."""
+        if not response:
+            return fallback_text, 0.5
+
+        cleaned = str(response).strip()
+        parsed: Any = None
+        try:
+            parsed = json.loads(cleaned)
+        except json.JSONDecodeError:
+            start = cleaned.find("{")
+            end = cleaned.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                try:
+                    parsed = json.loads(cleaned[start : end + 1])
+                except Exception:
+                    parsed = None
+
+        expanded_text = ""
+        confidence = 0.5
+
+        if isinstance(parsed, dict):
+            expanded_text = str(
+                parsed.get("expanded_text")
+                or parsed.get("expansion")
+                or parsed.get("text")
+                or ""
+            ).strip()
+            raw_conf = parsed.get("confidence", 0.5)
+            try:
+                confidence = float(raw_conf)
+            except (TypeError, ValueError):
+                confidence = 0.5
+        else:
+            expanded_text = cleaned.splitlines()[0].strip() if cleaned else ""
+
+        if not expanded_text:
+            expanded_text = fallback_text
+
+        confidence = max(0.0, min(1.0, confidence))
+        return expanded_text, confidence
+
+    async def enrich_hidden_information(
+        self,
+        content_list: List[Dict[str, Any]],
+        score_threshold: float = 0.55,
+        max_items_per_page: int = 3,
+        use_llm: bool = True,
+        max_chars: int = 1200,
+        cache_key: str | None = None,
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """Detect terse slide snippets and append grounded expanded_text blocks."""
+        report: Dict[str, Any] = {
+            "enabled": bool(use_llm),
+            "score_threshold": float(score_threshold),
+            "max_items_per_page": int(max_items_per_page),
+            "candidate_pages": 0,
+            "candidate_blocks": 0,
+            "expanded_blocks": 0,
+            "avg_hidden_score": 0.0,
+            "status": "skipped",
+        }
+
+        if not content_list:
+            report["status"] = "empty_content"
+            return content_list, report
+
+        effective_use_llm = (
+            bool(use_llm)
+            and hasattr(self, "llm_model_func")
+            and self.llm_model_func is not None
+        )
+        report["enabled"] = effective_use_llm
+        if not effective_use_llm:
+            report["status"] = "llm_unavailable"
+            return content_list, report
+        effective_cache_key = cache_key or getattr(self, "_latest_parse_cache_key", None)
+        if effective_cache_key:
+            cached_expand = await self._get_cached_hidden_expand(
+                cache_key=effective_cache_key
+            )
+            if cached_expand is not None:
+                cached_content, cached_report = cached_expand
+                report_from_cache = dict(cached_report)
+                report_from_cache["status"] = "cached"
+                self.logger.info(f"Using hidden expansion in cache: {cache_key}")
+                return cached_content, report_from_cache
+
+        detections = self.detect_hidden_info_candidates(
+            content_list=content_list,
+            score_threshold=score_threshold,
+            max_items_per_page=max_items_per_page,
+        )
+
+        if not detections:
+            report["status"] = "no_candidates"
+            return content_list, report
+
+        page_buckets = self._build_hidden_info_page_buckets(content_list)
+        enriched_content = list(content_list)
+
+        report["candidate_pages"] = len(detections)
+        report["candidate_blocks"] = sum(len(d["candidates"]) for d in detections)
+        report["avg_hidden_score"] = sum(d["hidden_score"] for d in detections) / max(
+            len(detections), 1
+        )
+
+        for detection in detections:
+            page_idx = detection["page_idx"]
+            page_items = page_buckets.get(page_idx, [])
+            page_context_units: List[str] = []
+            for _, item in page_items:
+                if item.get("type") in ["text", "expanded_text"]:
+                    txt = item.get("text", "")
+                    if isinstance(txt, str) and txt.strip():
+                        page_context_units.append(txt.strip())
+                elif item.get("type") == "list" and item.get("sub_type") == "text":
+                    li = item.get("list_items", [])
+                    if isinstance(li, list):
+                        page_context_units.extend(
+                            [x.strip() for x in li if isinstance(x, str) and x.strip()]
+                        )
+
+            page_context = "\n".join(page_context_units)
+            if len(page_context) > max_chars:
+                page_context = page_context[:max_chars]
+
+            for candidate in detection["candidates"]:
+                source_text = candidate["source_text"]
+                source_block_idx = candidate["source_block_idx"]
+                prompt = PROMPTS["HIDDEN_EXPAND_PROMPT"].format(
+                    page_idx=page_idx,
+                    source_text=source_text,
+                    page_context=page_context,
+                )
+
+                try:
+                    response = await self._call_llm_model(
+                        prompt,
+                        system_prompt=PROMPTS["HIDDEN_EXPAND_SYSTEM"],
+                    )
+                    expanded_text, confidence = self._parse_hidden_expand_response(
+                        response, source_text
+                    )
+                except Exception as e:
+                    self.logger.warning(
+                        f"Hidden-information expansion failed on page {page_idx}: {e}"
+                    )
+                    continue
+
+                if not expanded_text.strip():
+                    continue
+
+                enriched_content.append(
+                    {
+                        "type": "expanded_text",
+                        "text": expanded_text.strip(),
+                        "page_idx": int(page_idx),
+                        "source_page": int(page_idx),
+                        "source_block_idx": int(source_block_idx),
+                        "confidence": float(confidence),
+                        "hidden_score": float(detection["hidden_score"]),
+                        "reasons": detection["reasons"],
+                        "expansion_mode": "grounded",
+                    }
+                )
+                report["expanded_blocks"] += 1
+
+        report["status"] = (
+            "expanded" if report["expanded_blocks"] > 0 else "no_expansion_generated"
+        )
+
+        if effective_cache_key:
+            await self._store_cached_hidden_expand(
+                cache_key=effective_cache_key,
+                enriched_content=enriched_content,
+                hidden_expand_report=report,
+            )
+
+        return enriched_content, report
+
+    async def extract_page_topics(
+        self,
+        content_list: List[Dict[str, Any]],
+        use_llm: bool = True,
+        max_chars: int = 2000,
+    ) -> Dict[int, str]:
+        """
+        Extract one topic per page from parsed content_list.
+
+        Headers are used directly. If no header exists, the function optionally
+        calls llm_model_func with a concise prompt to infer a topic from page text
+        and image captions. When LLM is unavailable or disabled, it falls back to
+        a simple heuristic using the first text line on the page.
+        """
+
+        if not content_list:
+            return {}
+
+        # Resolve effective LLM usage based on availability
+        effective_use_llm = (
+            bool(use_llm)
+            and hasattr(self, "llm_model_func")
+            and self.llm_model_func is not None
+        )
+        summary_language = self._resolve_summary_language()
+
+        # Check cache first
+        cache_key = self._generate_page_topics_cache_key(
+            content_list, effective_use_llm, max_chars, summary_language
+        )
+        cached_topics = await self._get_cached_page_topics(
+            cache_key,
+            content_list,
+            effective_use_llm,
+            max_chars,
+            summary_language,
+        )
+        if cached_topics is not None:
+            self._page_topics_dict = cached_topics
+            self.logger.info("Using cached page topics")
+            return cached_topics
+
+        page_buckets: Dict[int, List[Dict[str, Any]]] = {}
+        for item in content_list:
+            if not isinstance(item, dict):
+                continue
+            page_idx = item.get("page_idx")
+            if page_idx is None:
+                continue
+            try:
+                page_key = int(page_idx)
+            except (ValueError, TypeError):
+                continue
+            page_buckets.setdefault(page_key, []).append(item)
+
+        page_topics: Dict[int, str] = {}
+
+        for page_idx in sorted(page_buckets.keys()):
+            items = page_buckets[page_idx]
+            '''
+            header_candidates = [
+                i.get("text", "").strip()
+                for i in items
+                if i.get("type") == "header"
+                and isinstance(i.get("text"), str)
+                and i.get("text").strip()
+            ]
+            if header_candidates:
+                page_topics[page_idx] = header_candidates[0]
+                continue
+            '''
+
+            # First pass: collect page text context (text + list[text])
+            text_parts: List[str] = []
+            for i in items:
+                if i.get("type") == "text" and isinstance(i.get("text"), str):
+                    text_parts.append(i["text"].strip())
+                elif i.get("type") == "list" and i.get("sub_type") == "text":
+                    li = i.get("list_items", [])
+                    if isinstance(li, list) and li:
+                        # 连接列表项为上下文文本
+                        joined = "\n".join([s.strip() for s in li if isinstance(s, str)])
+                        if joined:
+                            text_parts.append(joined)
+
+            page_context = "\n".join([p for p in text_parts if p])
+            #print(f"Page {page_idx} context text: {page_context}")
+
+            # Second pass: handle images with context-aware description
+            image_parts: List[str] = []
+            image_tag = "Image" if summary_language == "English" else "图片"
+            caption_tag = "Caption" if summary_language == "English" else "图注"
+            footnote_tag = "Footnotes" if summary_language == "English" else "脚注"
+            for i in items:
+                if i.get("type") == "image":
+                    image_desc = await self._describe_image_for_topic(
+                        i, page_context, summary_language
+                    )
+                    if image_desc:
+                        image_parts.append(f"{image_tag}: {image_desc}")
+
+                    captions = i.get("image_caption") or i.get("img_caption") or []
+                    footnotes = i.get("image_footnote") or []
+
+                    if isinstance(captions, list):
+                        captions = " ".join(
+                            [c.strip() for c in captions if isinstance(c, str)]
+                        )
+                    if isinstance(footnotes, list):
+                        footnotes = " ".join(
+                            [f.strip() for f in footnotes if isinstance(f, str)]
+                        )
+
+                    if isinstance(captions, str) and captions.strip():
+                        image_parts.append(f"{caption_tag}: {captions.strip()}")
+                    if isinstance(footnotes, str) and footnotes.strip():
+                        image_parts.append(f"{footnote_tag}: {footnotes.strip()}")
+
+            page_text = "\n".join([p for p in text_parts + image_parts if p])
+
+            if summary_language == "English":
+                fallback_topic = "Page_{0}".format(page_idx)
+            else:
+                fallback_topic = "第{0}页".format(page_idx)
+            if text_parts:
+                first_line = text_parts[0].splitlines()[0].strip()
+                if first_line:
+                    fallback_topic = (
+                        first_line if len(first_line) <= 80 else first_line[:77] + "..."
+                    )
+
+            if not page_text.strip():
+                page_topics[page_idx] = fallback_topic
+                continue
+
+            if not effective_use_llm:
+                page_topics[page_idx] = fallback_topic
+                continue
+
+            truncated_text = page_text[:max_chars]
+            prompt = PROMPTS["PAGE_TOPIC_PROMPT"].format(
+                page_idx=page_idx,
+                page_content=truncated_text,
+                fallback_topic=fallback_topic,
+            )
+            if summary_language == "English":
+                prompt += "\nLanguage requirement: The topic must be in English."
+            else:
+                prompt += "\n语言要求：topic字段必须使用中文。"
+
+            try:
+                response = await self._call_llm_model(
+                    prompt, system_prompt=PROMPTS["PAGE_TOPIC_SYSTEM"]
+                )
+                topic = self._parse_page_topic_response(response, fallback_topic)
+                page_topics[page_idx] = topic
+            except Exception as e:
+                self.logger.warning(
+                    f"Failed to extract page topic for page {page_idx}: {e}"
+                )
+                page_topics[page_idx] = fallback_topic
+
+        self._page_topics_dict = page_topics
+        await self._store_cached_page_topics(
+            cache_key,
+            content_list,
+            page_topics,
+            effective_use_llm,
+            max_chars,
+            summary_language,
+        )
+        return page_topics
+
+
+    async def build_page_topic_relations(
+        self,
+        page_topics: Dict[int, str],
+        cosine_threshold: float = 0.82,
+        file_path: str = "page_topics",
+        merge_case_insensitive: bool = True,
+    ) -> None:
+        """
+        Build relations among page topic entities and store them in LightRAG KG.
+
+        Steps:
+        1) Merge identical topics (case-insensitive by default)
+        2) Compute pairwise cosine similarity on topic embeddings
+        3) If similarity >= threshold, create relation edge
+        """
+
+        if not page_topics:
+            return
+
+        init_result = await self._ensure_lightrag_initialized()
+        if isinstance(init_result, dict) and not init_result.get("success", True):
+            raise RuntimeError(
+                f"LightRAG 初始化失败: {init_result.get('error', 'unknown error')}"
+            )
+
+        def _normalize_topic(text: str) -> str:
+            normalized = text.strip()
+            if merge_case_insensitive:
+                normalized = normalized.lower()
+            # remove common bullets and extra spaces
+            normalized = normalized.replace("•", " ").replace("◼", " ")
+            normalized = " ".join(normalized.split())
+            return normalized
+
+        # Merge identical topics
+        merged: Dict[str, Dict[str, Any]] = {}
+        for page_idx, topic in page_topics.items():
+            if not isinstance(topic, str) or not topic.strip():
+                continue
+            norm = _normalize_topic(topic)
+            if not norm:
+                continue
+            if norm not in merged:
+                merged[norm] = {
+                    "topic": topic.strip(),
+                    "pages": [int(page_idx)],
+                }
+            else:
+                merged[norm]["pages"].append(int(page_idx))
+
+        # Prepare entities_vdb payload for page topics
+        entities_vdb_payload: Dict[str, Any] = {}
+
+        topics = [item["topic"] for item in merged.values()]
+        if len(topics) < 2:
+            # still ensure nodes are stored
+            for item in merged.values():
+                node_data = {
+                    "entity_id": item["topic"],
+                    "entity_type": "page_topic",
+                    "description": f"Page topic merged from pages: {sorted(item['pages'])}",
+                    "source_id": "page_topic_dict",
+                    "file_path": file_path,
+                    "pages": ",".join(str(p) for p in sorted(item["pages"])),
+                    "created_at": int(time.time()),
+                }
+                await self.lightrag.chunk_entity_relation_graph.upsert_node(
+                    item["topic"], node_data=node_data
+                )
+
+                # Store page topic entity into entities_vdb for vector search
+                entity_id = compute_mdhash_id(item["topic"], prefix="ent-")
+                entities_vdb_payload[entity_id] = {
+                    "entity_name": item["topic"],
+                    "entity_type": "page_topic",
+                    "content": f"{item['topic']}\n{node_data['description']}",
+                    "source_id": "page_topic_dict",
+                    "file_path": file_path,
+                }
+
+            if entities_vdb_payload:
+                await self.lightrag.entities_vdb.upsert(entities_vdb_payload)
+                await self.lightrag.entities_vdb.index_done_callback()
+            return
+
+        # Compute embeddings
+        embeddings = await self.embedding_func(topics)
+        if embeddings.ndim == 1:
+            embeddings = embeddings.reshape(1, -1)
+
+        # Normalize embeddings
+        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+        norms[norms == 0] = 1e-8
+        normed = embeddings / norms
+
+        # Store nodes
+        for item in merged.values():
+            node_data = {
+                "entity_id": item["topic"],
+                "entity_type": "page_topic",
+                "description": f"Page topic merged from pages: {sorted(item['pages'])}",
+                "source_id": "page_topic_dict",
+                "file_path": file_path,
+                "pages": ",".join(str(p) for p in sorted(item["pages"])),
+                "created_at": int(time.time()),
+            }
+            await self.lightrag.chunk_entity_relation_graph.upsert_node(
+                item["topic"], node_data=node_data
+            )
+
+            # Store page topic entity into entities_vdb for vector search
+            entity_id = compute_mdhash_id(item["topic"], prefix="ent-")
+            entities_vdb_payload[entity_id] = {
+                "entity_name": item["topic"],
+                "entity_type": "page_topic",
+                "content": f"{item['topic']}\n{node_data['description']}",
+                "source_id": "page_topic_dict",
+                "file_path": file_path,
+            }
+
+        if entities_vdb_payload:
+            await self.lightrag.entities_vdb.upsert(entities_vdb_payload)
+            await self.lightrag.entities_vdb.index_done_callback()
+
+        # Create edges based on cosine similarity
+        topic_list = [item["topic"] for item in merged.values()]
+        n = len(topic_list)
+        for i in range(n):
+            for j in range(i + 1, n):
+                sim = float(np.dot(normed[i], normed[j]))
+                if sim >= cosine_threshold:
+                    src = topic_list[i]
+                    tgt = topic_list[j]
+                    edge_data = {
+                        "weight": sim,
+                        "description": f"Topic similarity (cosine={sim:.4f}) between '{src}' and '{tgt}'",
+                        "keywords": "related_to,cosine_sim",
+                        "source_id": "page_topic_relation",
+                        "file_path": file_path,
+                        "created_at": int(time.time()),
+                    }
+                    await self.lightrag.chunk_entity_relation_graph.upsert_edge(
+                        src, tgt, edge_data=edge_data
+                    )
+
+    async def build_page_entity_topic_relations_text_only(
+        self,
+        page_topics: Dict[int, str],
+        content_list: List[Dict[str, Any]],
+        doc_id: str,
+        file_path: str,
+        separator: str = "\n<<<PAGE_BREAK>>>\n",
+        page_marker_re: str | re.Pattern = r"<<PAGE:(\d+)>>",
+    ) -> None:
+        """
+        Build relations between page entities and page topic entities (text-only).
+
+        Requirements:
+        - Uses explicit inputs only (no cached state)
+        - Text with page markers must have been inserted into LightRAG beforehand
+        - Maps entity source_id(chunk_id) to page_idx, then links to page topic
+        """
+
+        if not page_topics:
+            raise RuntimeError("page_topics 为空，请先调用 extract_page_topics")
+
+        if not content_list:
+            raise RuntimeError("content_list 为空，请先完成解析")
+
+        if not doc_id:
+            raise RuntimeError("doc_id 不能为空，请传入文本插入时的 doc_id")
+
+        if not file_path:
+            raise RuntimeError("file_path 不能为空，请传入原始文件路径")
+
+        init_result = await self._ensure_lightrag_initialized()
+        if isinstance(init_result, dict) and not init_result.get("success", True):
+            raise RuntimeError(
+                f"LightRAG 初始化失败: {init_result.get('error', 'unknown error')}"
+            )
+
+        if isinstance(page_marker_re, str):
+            page_marker_re = re.compile(page_marker_re)
+
+        _, _, page_texts = separate_content(content_list, return_page_texts=True)
+        if not page_texts:
+            self.logger.warning("没有可用的纯文本页内容，跳过页实体关系构建")
+            return
+
+        page_chunks: List[str] = []
+        for page_idx in sorted(page_texts.keys()):
+            page_text = page_texts[page_idx].strip()
+            if not page_text:
+                continue
+            page_chunks.append(f"<<PAGE:{page_idx}>>\n{page_text}")
+
+        if not page_chunks:
+            self.logger.warning("分页文本为空，跳过页实体关系构建")
+            return
+
+        full_text = separator.join(page_chunks)
+        file_ref = self._get_file_reference(file_path)
+
+        await insert_text_content(
+            self.lightrag,
+            input=full_text,
+            split_by_character=separator,
+            split_by_character_only=True,
+            ids=doc_id,
+            file_paths=file_ref,
+        )
+
+        doc_status = await self.lightrag.doc_status.get_by_id(doc_id)
+        if not doc_status:
+            raise RuntimeError("无法获取 doc_status，请确认文本已成功插入")
+
+        chunk_ids = doc_status.get("chunks_list", [])
+        if not chunk_ids:
+            raise RuntimeError("doc_status 中没有 chunks_list，无法建立页映射")
+
+        chunk_to_page: Dict[str, int] = {}
+        for chunk_id in chunk_ids:
+            chunk = await self.lightrag.text_chunks.get_by_id(chunk_id)
+            if not chunk:
+                continue
+            content = chunk.get("content", "")
+            match = page_marker_re.search(content)
+            if match:
+                chunk_to_page[chunk_id] = int(match.group(1))
+
+        if not chunk_to_page:
+            raise RuntimeError("未从 chunk 内容中解析到页号标记")
+
+        # Build relations: entity -> page_topic
+        nodes = await self.lightrag.chunk_entity_relation_graph.get_all_nodes()
+        for node in nodes:
+            entity_type = node.get("entity_type")
+            if entity_type == "page_topic":
+                continue
+
+            node_id = node.get("id") or node.get("entity_id") or node.get("entity_name")
+            if not node_id:
+                continue
+
+            source_id = str(node.get("source_id", ""))
+            if not source_id:
+                continue
+
+            source_chunk_ids = [cid for cid in source_id.split(GRAPH_FIELD_SEP) if cid]
+            for cid in source_chunk_ids:
+                if cid not in chunk_to_page:
+                    continue
+
+                page_idx = chunk_to_page[cid]
+                page_topic = page_topics.get(page_idx)
+                if not page_topic:
+                    continue
+
+                if not await self.lightrag.chunk_entity_relation_graph.has_node(page_topic):
+                    await self.lightrag.chunk_entity_relation_graph.upsert_node(
+                        page_topic,
+                        node_data={
+                            "entity_id": page_topic,
+                            "entity_type": "page_topic",
+                            "description": f"Page topic for page {page_idx}",
+                            "source_id": "page_topic_dict",
+                            "file_path": file_ref,
+                            "pages": str(page_idx),
+                            "created_at": int(time.time()),
+                        },
+                    )
+
+                edge_data = {
+                    "weight": 1.0,
+                    "description": f"Entity {node_id} belongs to page topic {page_topic}",
+                    "keywords": "belongs_to,page_topic",
+                    "source_id": cid,
+                    "file_path": file_ref,
+                    "created_at": int(time.time()),
+                }
+                await self.lightrag.chunk_entity_relation_graph.upsert_edge(
+                    node_id, page_topic, edge_data=edge_data
+                )
+    
+    async def _get_cached_result(
+        self, cache_key: str, file_path: Path, parse_method: str = None, **kwargs
+    ) -> tuple[List[Dict[str, Any]], str] | None:
+        """
+        Get cached parsing result if available and valid
+
+        Args:
+            cache_key: Cache key to look up
+            file_path: Path to the file for mtime check
+            parse_method: Parse method used
+            **kwargs: Additional parser parameters
+
+        Returns:
+            tuple[List[Dict[str, Any]], str] | None: (content_list, doc_id) or None if not found/invalid
+        """
+        if not hasattr(self, "parse_cache") or self.parse_cache is None:
+            return None
+
+        cache_file = getattr(self.parse_cache, "_file_name", "unknown")
+        cache_workspace = getattr(self.parse_cache, "workspace", "")
+        lightrag_working_dir = getattr(getattr(self, "lightrag", None), "working_dir", "unknown")
+
+        try:
+            cached_data = await self.parse_cache.get_by_id(cache_key)
+            if not cached_data:
+                self.logger.debug(
+                    "Parse cache miss: key=%s workspace=%s file=%s lightrag_working_dir=%s",
+                    cache_key,
+                    cache_workspace,
+                    cache_file,
+                    lightrag_working_dir,
+                )
+                return None
+            # Check file modification time
+            current_mtime = file_path.stat().st_mtime
+            cached_mtime = cached_data.get("mtime", 0)
+
+            if current_mtime != cached_mtime:
+                self.logger.debug(f"Cache invalid - file modified: {cache_key}")
+                return None
+
+            # Check parsing configuration
+            cached_config = cached_data.get("parse_config", {})
+            current_config = {
+                "parser": self.config.parser,
+                "parse_method": parse_method or self.config.parse_method,
+            }
+
+            # Add relevant kwargs to current config
+            relevant_kwargs = {
+                k: v
+                for k, v in kwargs.items()
+                if k
+                in [
+                    "lang",
+                    "device",
+                    "start_page",
+                    "end_page",
+                    "formula",
+                    "table",
+                    "backend",
+                    "source",
+                ]
+            }
+            current_config.update(relevant_kwargs)
+
+            if cached_config != current_config:
+                self.logger.debug(f"Cache invalid - config changed: {cache_key}")
+                return None
+
+            content_list = cached_data.get("content_list", [])
+            doc_id = cached_data.get("doc_id")
+
+            if content_list and doc_id:
+                self.logger.debug(
+                    f"Found valid cached parsing result for key: {cache_key}"
+                )
+                self.logger.info(
+                    "Parse cache hit: key=%s workspace=%s file=%s lightrag_working_dir=%s",
+                    cache_key,
+                    cache_workspace,
+                    cache_file,
+                    lightrag_working_dir,
+                )
+                return content_list, doc_id
+            else:
+                self.logger.debug(
+                    f"Cache incomplete - missing content or doc_id: {cache_key}"
+                )
+                return None
+
+        except Exception as e:
+            self.logger.warning(f"Error accessing parse cache: {e}")
+
+        return None
+
+    async def _store_cached_result(
+        self,
+        cache_key: str,
+        content_list: List[Dict[str, Any]],
+        doc_id: str,
+        file_path: Path,
+        parse_method: str = None,
+        **kwargs,
+    ) -> None:
+        """
+        Store parsing result in cache
+
+        Args:
+            cache_key: Cache key to store under
+            content_list: Content list to cache
+            doc_id: Content-based document ID
+            file_path: Path to the file for mtime storage
+            parse_method: Parse method used
+            **kwargs: Additional parser parameters
+        """
+        if not hasattr(self, "parse_cache") or self.parse_cache is None:
+            return
+
+        cache_file = getattr(self.parse_cache, "_file_name", "unknown")
+        cache_workspace = getattr(self.parse_cache, "workspace", "")
+        lightrag_working_dir = getattr(getattr(self, "lightrag", None), "working_dir", "unknown")
+
+        try:
+            # Get file modification time
+            file_mtime = file_path.stat().st_mtime
+
+            # Create parsing configuration
+            parse_config = {
+                "parser": self.config.parser,
+                "parse_method": parse_method or self.config.parse_method,
+            }
+
+            # Add relevant kwargs to config
+            relevant_kwargs = {
+                k: v
+                for k, v in kwargs.items()
+                if k
+                in [
+                    "lang",
+                    "device",
+                    "start_page",
+                    "end_page",
+                    "formula",
+                    "table",
+                    "backend",
+                    "source",
+                ]
+            }
+            parse_config.update(relevant_kwargs)
+
+            cache_data = {
+                cache_key: {
+                    "content_list": content_list,
+                    "doc_id": doc_id,
+                    "mtime": file_mtime,
+                    "parse_config": parse_config,
+                    "cached_at": time.time(),
+                    "cache_version": "1.0",
+                }
+            }
+            await self.parse_cache.upsert(cache_data)
+            # Ensure data is persisted to disk
+            await self.parse_cache.index_done_callback()
+            self.logger.info(f"Stored parsing result in cache: {cache_key}")
+            self.logger.info(
+                "Parse cache write: key=%s workspace=%s file=%s lightrag_working_dir=%s",
+                cache_key,
+                cache_workspace,
+                cache_file,
+                lightrag_working_dir,
+            )
+        except Exception as e:
+            self.logger.warning(f"Error storing to parse cache: {e}")
+
+    async def parse_document(
+        self,
+        file_path: str,
+        output_dir: str = None,
+        parse_method: str = None,
+        display_stats: bool = None,
+        **kwargs,
+    ) -> tuple[List[Dict[str, Any]], str]:
+        """
+        Parse document with caching support
+
+        Args:
+            file_path: Path to the file to parse
+            output_dir: Output directory (defaults to config.parser_output_dir)
+            parse_method: Parse method (defaults to config.parse_method)
+            display_stats: Whether to display content statistics (defaults to config.display_content_stats)
+            **kwargs: Additional parameters for parser (e.g., lang, device, start_page, end_page, formula, table, backend, source)
+
+        Returns:
+            tuple[List[Dict[str, Any]], str]: (content_list, doc_id)
+        """
+        # Use config defaults if not provided
+        if output_dir is None:
+            output_dir = self.config.parser_output_dir
+        if parse_method is None:
+            parse_method = self.config.parse_method
+        if display_stats is None:
+            display_stats = self.config.display_content_stats
+
+        self.logger.info(f"Starting document parsing: {file_path}")
+
+        file_path = Path(file_path)
+        if not file_path.exists():
+            raise FileNotFoundError(f"File not found: {file_path}")
+
+        # Generate cache key based on file and configuration
+        cache_key = self._generate_cache_key(file_path, parse_method, **kwargs)
+        self._latest_parse_cache_key = cache_key
+        print(f"Generated cache key: {cache_key} for file: {file_path}")
+        # Check cache first
+        cached_result = await self._get_cached_result(
+            cache_key, file_path, parse_method, **kwargs
+        )
+        if cached_result is not None:
+            content_list, doc_id = cached_result
+            self.logger.info(f"Using cached parsing result for: {file_path}")
+            if display_stats:
+                self.logger.info(
+                    f"* Total blocks in cached content_list: {len(content_list)}"
+                )
+            # Cache latest parse for downstream page-entity linking
+            self._latest_content_list = content_list
+            self._latest_doc_id = doc_id
+            self._latest_file_path = str(file_path)
+            return content_list, doc_id
+
+        # Choose appropriate parsing method based on file extension
+        ext = file_path.suffix.lower()
+
+        try:
+            doc_parser = (
+                DoclingParser() if self.config.parser == "docling" else MineruParser()
+            )
+
+            # Log parser and method information
+            self.logger.info(
+                f"Using {self.config.parser} parser with method: {parse_method}"
+            )
+
+            if ext in [".pdf"]:
+                self.logger.info("Detected PDF file, using parser for PDF...")
+                content_list = await asyncio.to_thread(
+                    doc_parser.parse_pdf,
+                    pdf_path=file_path,
+                    output_dir=output_dir,
+                    method=parse_method,
+                    **kwargs,
+                )
+            elif ext in [
+                ".jpg",
+                ".jpeg",
+                ".png",
+                ".bmp",
+                ".tiff",
+                ".tif",
+                ".gif",
+                ".webp",
+            ]:
+                self.logger.info("Detected image file, using parser for images...")
+                # Use the selected parser's image parsing capability
+                if hasattr(doc_parser, "parse_image"):
+                    content_list = await asyncio.to_thread(
+                        doc_parser.parse_image,
+                        image_path=file_path,
+                        output_dir=output_dir,
+                        **kwargs,
+                    )
+                else:
+                    # Fallback to MinerU for image parsing if current parser doesn't support it
+                    self.logger.warning(
+                        f"{self.config.parser} parser doesn't support image parsing, falling back to MinerU"
+                    )
+                    content_list = MineruParser().parse_image(
+                        image_path=file_path, output_dir=output_dir, **kwargs
+                    )
+            elif ext in [
+                ".doc",
+                ".docx",
+                ".ppt",
+                ".pptx",
+                ".xls",
+                ".xlsx",
+                ".html",
+                ".htm",
+                ".xhtml",
+            ]:
+                self.logger.info(
+                    "Detected Office or HTML document, using parser for Office/HTML..."
+                )
+                content_list = await asyncio.to_thread(
+                    doc_parser.parse_office_doc,
+                    doc_path=file_path,
+                    output_dir=output_dir,
+                    **kwargs,
+                )
+            else:
+                # For other or unknown formats, use generic parser
+                self.logger.info(
+                    f"Using generic parser for {ext} file (method={parse_method})..."
+                )
+                content_list = await asyncio.to_thread(
+                    doc_parser.parse_document,
+                    file_path=file_path,
+                    method=parse_method,
+                    output_dir=output_dir,
+                    **kwargs,
+                )
+
+        except MineruExecutionError as e:
+            self.logger.error(f"Mineru command failed: {e}")
+            raise
+        except Exception as e:
+            self.logger.error(
+                f"Error during parsing with {self.config.parser} parser: {str(e)}"
+            )
+            raise e
+
+        msg = f"Parsing {file_path} complete! Extracted {len(content_list)} content blocks"
+        self.logger.info(msg)
+
+        if len(content_list) == 0:
+            raise ValueError("Parsing failed: No content was extracted")
+
+        # Generate doc_id based on content
+        doc_id = self._generate_content_based_doc_id(content_list)
+
+        # Store result in cache
+        await self._store_cached_result(
+            cache_key, content_list, doc_id, file_path, parse_method, **kwargs
+        )
+
+        # Cache latest parse for downstream page-entity linking
+        self._latest_content_list = content_list
+        self._latest_doc_id = doc_id
+        self._latest_file_path = str(file_path)
+
+        # Display content statistics if requested
+        if display_stats:
+            self.logger.info("\nContent Information:")
+            self.logger.info(f"* Total blocks in content_list: {len(content_list)}")
+
+            # Count elements by type
+            block_types: Dict[str, int] = {}
+            for block in content_list:
+                if isinstance(block, dict):
+                    block_type = block.get("type", "unknown")
+                    if isinstance(block_type, str):
+                        block_types[block_type] = block_types.get(block_type, 0) + 1
+
+            self.logger.info("* Content block types:")
+            for block_type, count in block_types.items():
+                self.logger.info(f"  - {block_type}: {count}")
+
+        return content_list, doc_id
+
+    async def _process_multimodal_content(
+        self,
+        multimodal_items: List[Dict[str, Any]],
+        file_path: str,
+        doc_id: str,
+        pipeline_status: Optional[Any] = None,
+        pipeline_status_lock: Optional[Any] = None,
+    ):
+        """
+        Process multimodal content (using specialized processors)
+
+        Args:
+            multimodal_items: List of multimodal items
+            file_path: File path (for reference)
+            doc_id: Document ID for proper chunk association
+            pipeline_status: Pipeline status object
+            pipeline_status_lock: Pipeline status lock
+        """
+
+        if not multimodal_items:
+            self.logger.debug("No multimodal content to process")
+            return
+
+        # Check multimodal processing status - handle LightRAG's early DocStatus.PROCESSED marking
+        try:
+            existing_doc_status = await self.lightrag.doc_status.get_by_id(doc_id)
+            if existing_doc_status:
+                # Check if multimodal content is already processed
+                multimodal_processed = existing_doc_status.get(
+                    "multimodal_processed", False
+                )
+
+                if multimodal_processed:
+                    self.logger.info(
+                        f"Document {doc_id} multimodal content is already processed"
+                    )
+                    return
+
+                # Even if status is DocStatus.PROCESSED (text processing done),
+                # we still need to process multimodal content if not yet done
+                doc_status = existing_doc_status.get("status", "")
+                if doc_status == DocStatus.PROCESSED and not multimodal_processed:
+                    self.logger.info(
+                        f"Document {doc_id} text processing is complete, but multimodal content still needs processing"
+                    )
+                    # Continue with multimodal processing
+                elif doc_status == DocStatus.PROCESSED and multimodal_processed:
+                    self.logger.info(
+                        f"Document {doc_id} is fully processed (text + multimodal)"
+                    )
+                    return
+
+        except Exception as e:
+            self.logger.debug(f"Error checking document status for {doc_id}: {e}")
+            # Continue with processing if cache check fails
+
+        # Use ProcessorMixin's own batch processing that can handle multiple content types
+        log_message = "Starting multimodal content processing..."
+        self.logger.info(log_message)
+        if pipeline_status_lock and pipeline_status:
+            async with pipeline_status_lock:
+                pipeline_status["latest_message"] = log_message
+                pipeline_status["history_messages"].append(log_message)
+
+        try:
+            # Ensure LightRAG is initialized
+            await self._ensure_lightrag_initialized()
+
+            await self._process_multimodal_content_batch_type_aware(
+                multimodal_items=multimodal_items, file_path=file_path, doc_id=doc_id
+            )
+
+            # Mark multimodal content as processed and update final status
+            await self._mark_multimodal_processing_complete(doc_id)
+
+            log_message = "Multimodal content processing complete"
+            self.logger.info(log_message)
+            if pipeline_status_lock and pipeline_status:
+                async with pipeline_status_lock:
+                    pipeline_status["latest_message"] = log_message
+                    pipeline_status["history_messages"].append(log_message)
+
+        except Exception as e:
+            self.logger.error(f"Error in multimodal processing: {e}")
+            # Fallback to individual processing if batch processing fails
+            self.logger.warning("Falling back to individual multimodal processing")
+            await self._process_multimodal_content_individual(
+                multimodal_items, file_path, doc_id
+            )
+
+            # Mark multimodal content as processed even after fallback
+            await self._mark_multimodal_processing_complete(doc_id)
+
+    async def _process_multimodal_content_individual(
+        self, multimodal_items: List[Dict[str, Any]], file_path: str, doc_id: str
+    ):
+        """
+        Process multimodal content individually (fallback method)
+
+        Args:
+            multimodal_items: List of multimodal items
+            file_path: File path (for reference)
+            doc_id: Document ID for proper chunk association
+        """
+        # Use full path or basename based on config
+        file_name = self._get_file_reference(file_path)
+
+        # Collect all chunk results for batch processing (similar to text content processing)
+        all_chunk_results = []
+        multimodal_chunk_ids = []
+
+        # Get current text chunks count to set proper order indexes for multimodal chunks
+        existing_doc_status = await self.lightrag.doc_status.get_by_id(doc_id)
+        existing_chunks_count = (
+            existing_doc_status.get("chunks_count", 0) if existing_doc_status else 0
+        )
+
+        for i, item in enumerate(multimodal_items):
+            try:
+                content_type = item.get("type", "unknown")
+                self.logger.info(
+                    f"Processing item {i+1}/{len(multimodal_items)}: {content_type} content"
+                )
+
+                # Select appropriate processor
+                processor = get_processor_for_type(self.modal_processors, content_type)
+
+                if processor:
+                    # Prepare item info for context extraction
+                    item_info = {
+                        "page_idx": item.get("page_idx", 0),
+                        "index": i,
+                        "type": content_type,
+                    }
+
+                    # Process content and get chunk results instead of immediately merging
+                    (
+                        enhanced_caption,
+                        entity_info,
+                        chunk_results,
+                    ) = await processor.process_multimodal_content(
+                        modal_content=item,
+                        content_type=content_type,
+                        file_path=file_name,
+                        item_info=item_info,  # Pass item info for context extraction
+                        batch_mode=True,
+                        doc_id=doc_id,  # Pass doc_id for proper association
+                        chunk_order_index=existing_chunks_count
+                        + i,  # Proper order index
+                    )
+
+                    # Collect chunk results for batch processing
+                    all_chunk_results.extend(chunk_results)
+
+                    # Extract chunk ID from the entity_info (actual chunk_id created by processor)
+                    if entity_info and "chunk_id" in entity_info:
+                        chunk_id = entity_info["chunk_id"]
+                        multimodal_chunk_ids.append(chunk_id)
+
+                    self.logger.info(
+                        f"{content_type} processing complete: {entity_info.get('entity_name', 'Unknown')}"
+                    )
+                else:
+                    self.logger.warning(
+                        f"No suitable processor found for {content_type} type content"
+                    )
+
+            except Exception as e:
+                self.logger.error(f"Error processing multimodal content: {str(e)}")
+                self.logger.debug("Exception details:", exc_info=True)
+                continue
+
+        # Update doc_status to include multimodal chunks in the standard chunks_list
+        if multimodal_chunk_ids:
+            try:
+                # Get current document status
+                current_doc_status = await self.lightrag.doc_status.get_by_id(doc_id)
+
+                if current_doc_status:
+                    existing_chunks_list = current_doc_status.get("chunks_list", [])
+                    existing_chunks_count = current_doc_status.get("chunks_count", 0)
+
+                    # Add multimodal chunks to the standard chunks_list
+                    updated_chunks_list = existing_chunks_list + multimodal_chunk_ids
+                    updated_chunks_count = existing_chunks_count + len(
+                        multimodal_chunk_ids
+                    )
+
+                    # Update document status with integrated chunk list
+                    await self.lightrag.doc_status.upsert(
+                        {
+                            doc_id: {
+                                **current_doc_status,  # Keep existing fields
+                                "chunks_list": updated_chunks_list,  # Integrated chunks list
+                                "chunks_count": updated_chunks_count,  # Updated total count
+                                "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S+00:00"),
+                            }
+                        }
+                    )
+
+                    # Ensure doc_status update is persisted to disk
+                    await self.lightrag.doc_status.index_done_callback()
+
+                    self.logger.info(
+                        f"Updated doc_status with {len(multimodal_chunk_ids)} multimodal chunks integrated into chunks_list"
+                    )
+
+            except Exception as e:
+                self.logger.warning(
+                    f"Error updating doc_status with multimodal chunks: {e}"
+                )
+
+        # Batch merge all multimodal content results (similar to text content processing)
+        if all_chunk_results:
+            from lightrag.operate import merge_nodes_and_edges
+            from lightrag.kg.shared_storage import (
+                get_namespace_data,
+                get_pipeline_status_lock,
+            )
+
+            # Get pipeline status and lock from shared storage
+            pipeline_status = await get_namespace_data("pipeline_status")
+            pipeline_status_lock = get_pipeline_status_lock()
+
+            await merge_nodes_and_edges(
+                chunk_results=all_chunk_results,
+                knowledge_graph_inst=self.lightrag.chunk_entity_relation_graph,
+                entity_vdb=self.lightrag.entities_vdb,
+                relationships_vdb=self.lightrag.relationships_vdb,
+                global_config=self.lightrag.__dict__,
+                full_entities_storage=self.lightrag.full_entities,
+                full_relations_storage=self.lightrag.full_relations,
+                doc_id=doc_id,
+                pipeline_status=pipeline_status,
+                pipeline_status_lock=pipeline_status_lock,
+                llm_response_cache=self.lightrag.llm_response_cache,
+                current_file_number=1,
+                total_files=1,
+                file_path=file_name,
+            )
+
+            await self.lightrag._insert_done()
+
+        self.logger.info("Individual multimodal content processing complete")
+
+        # Mark multimodal content as processed
+        await self._mark_multimodal_processing_complete(doc_id)
+
+    async def _process_multimodal_content_batch_type_aware(
+        self, multimodal_items: List[Dict[str, Any]], file_path: str, doc_id: str
+    ):
+        """
+        Type-aware batch processing that selects correct processors based on content type.
+        This is the corrected implementation that handles different modality types properly.
+
+        Args:
+            multimodal_items: List of multimodal items with different types
+            file_path: File path for citation
+            doc_id: Document ID for proper association
+        """
+        if not multimodal_items:
+            self.logger.debug("No multimodal content to process")
+            return
+
+        # Get existing chunks count for proper order indexing
+        try:
+            existing_doc_status = await self.lightrag.doc_status.get_by_id(doc_id)
+            existing_chunks_count = (
+                existing_doc_status.get("chunks_count", 0) if existing_doc_status else 0
+            )
+        except Exception:
+            existing_chunks_count = 0
+
+        # Use LightRAG's concurrency control
+        semaphore = asyncio.Semaphore(getattr(self.lightrag, "max_parallel_insert", 2))
+
+        # Progress tracking variables
+        total_items = len(multimodal_items)
+        completed_count = 0
+        progress_lock = asyncio.Lock()
+
+        # Log processing start
+        self.logger.info(f"Starting to process {total_items} multimodal content items")
+
+        # Stage 1: Concurrent generation of descriptions using correct processors for each type
+        async def process_single_item_with_correct_processor(
+            item: Dict[str, Any], index: int, file_path: str
+        ):
+            """Process single item using the correct processor for its type"""
+            nonlocal completed_count
+            async with semaphore:
+                try:
+                    content_type = item.get("type", "unknown")
+
+                    # Select the correct processor based on content type
+                    processor = get_processor_for_type(
+                        self.modal_processors, content_type
+                    )
+
+                    if not processor:
+                        self.logger.warning(
+                            f"No processor found for type: {content_type}"
+                        )
+                        return None
+
+                    item_info = {
+                        "page_idx": item.get("page_idx", 0),
+                        "index": index,
+                        "type": content_type,
+                    }
+
+                    # Call the correct processor's description generation method
+                    (
+                        description,
+                        entity_info,
+                    ) = await processor.generate_description_only(
+                        modal_content=item,
+                        content_type=content_type,
+                        item_info=item_info,
+                        entity_name=None,  # Let LLM auto-generate
+                    )
+
+                    # Update progress (non-blocking)
+                    async with progress_lock:
+                        completed_count += 1
+                        if (
+                            completed_count % max(1, total_items // 10) == 0
+                            or completed_count == total_items
+                        ):
+                            progress_percent = (completed_count / total_items) * 100
+                            self.logger.info(
+                                f"Multimodal chunk generation progress: {completed_count}/{total_items} ({progress_percent:.1f}%)"
+                            )
+
+                    return {
+                        "index": index,
+                        "content_type": content_type,
+                        "description": description,
+                        "entity_info": entity_info,
+                        "original_item": item,
+                        "item_info": item_info,
+                        "chunk_order_index": existing_chunks_count + index,
+                        "processor": processor,  # Keep reference to the processor used
+                        "file_path": file_path,  # Add file_path to the result
+                    }
+
+                except Exception as e:
+                    # Update progress even on error (non-blocking)
+                    async with progress_lock:
+                        completed_count += 1
+                        if (
+                            completed_count % max(1, total_items // 10) == 0
+                            or completed_count == total_items
+                        ):
+                            progress_percent = (completed_count / total_items) * 100
+                            self.logger.info(
+                                f"Multimodal chunk generation progress: {completed_count}/{total_items} ({progress_percent:.1f}%)"
+                            )
+
+                    self.logger.error(
+                        f"Error generating description for {content_type} item {index}: {e}"
+                    )
+                    return None
+
+        # Process all items concurrently with correct processors
+        tasks = [
+            asyncio.create_task(
+                process_single_item_with_correct_processor(item, i, file_path)
+            )
+            for i, item in enumerate(multimodal_items)
+        ]
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Filter successful results
+        multimodal_data_list = []
+        for result in results:
+            if isinstance(result, Exception):
+                self.logger.error(f"Task failed: {result}")
+                continue
+            if result is not None:
+                multimodal_data_list.append(result)
+
+        if not multimodal_data_list:
+            self.logger.warning("No valid multimodal descriptions generated")
+            return
+
+        self.logger.info(
+            f"Generated descriptions for {len(multimodal_data_list)}/{len(multimodal_items)} multimodal items using correct processors"
+        )
+
+        # Stage 2: Convert to LightRAG chunks format
+        lightrag_chunks = self._convert_to_lightrag_chunks_type_aware(
+            multimodal_data_list, file_path, doc_id
+        )
+
+        # Stage 3: Store chunks to LightRAG storage
+        await self._store_chunks_to_lightrag_storage_type_aware(lightrag_chunks)
+
+        # Stage 3.5: Store multimodal main entities to entities_vdb and full_entities
+        await self._store_multimodal_main_entities(
+            multimodal_data_list, lightrag_chunks, file_path, doc_id
+        )
+
+        # Track chunk IDs for doc_status update
+        chunk_ids = list(lightrag_chunks.keys())
+
+        # Stage 4: Use LightRAG's batch entity relation extraction
+        chunk_results = await self._batch_extract_entities_lightrag_style_type_aware(
+            lightrag_chunks
+        )
+
+        # Stage 5: Add belongs_to relations (multimodal-specific)
+        enhanced_chunk_results = await self._batch_add_belongs_to_relations_type_aware(
+            chunk_results, multimodal_data_list
+        )
+
+        # Stage 6: Use LightRAG's batch merge
+        await self._batch_merge_lightrag_style_type_aware(
+            enhanced_chunk_results, file_path, doc_id
+        )
+
+        # Stage 7: Update doc_status with integrated chunks_list
+        await self._update_doc_status_with_chunks_type_aware(doc_id, chunk_ids)
+
+    def _convert_to_lightrag_chunks_type_aware(
+        self, multimodal_data_list: List[Dict[str, Any]], file_path: str, doc_id: str
+    ) -> Dict[str, Any]:
+        """Convert multimodal data to LightRAG standard chunks format"""
+
+        chunks = {}
+
+        for data in multimodal_data_list:
+            description = data["description"]
+            entity_info = data["entity_info"]
+            chunk_order_index = data["chunk_order_index"]
+            content_type = data["content_type"]
+            original_item = data["original_item"]
+
+            # Apply the appropriate chunk template based on content type
+            formatted_chunk_content = self._apply_chunk_template(
+                content_type, original_item, description
+            )
+
+            # Generate chunk_id
+            chunk_id = compute_mdhash_id(formatted_chunk_content, prefix="chunk-")
+
+            # Calculate tokens
+            tokens = len(self.lightrag.tokenizer.encode(formatted_chunk_content))
+
+            # Use full path or basename based on config
+            file_ref = self._get_file_reference(file_path)
+
+            # Build LightRAG standard chunk format
+            chunks[chunk_id] = {
+                "content": formatted_chunk_content,  # Now uses the templated content
+                "tokens": tokens,
+                "full_doc_id": doc_id,
+                "chunk_order_index": chunk_order_index,
+                "file_path": file_ref,
+                "llm_cache_list": [],  # LightRAG will populate this field
+                # Multimodal-specific metadata
+                "is_multimodal": True,
+                "modal_entity_name": entity_info["entity_name"],
+                "original_type": data["content_type"],
+                "page_idx": data["item_info"].get("page_idx", 0),
+            }
+
+        self.logger.debug(
+            f"Converted {len(chunks)} multimodal items to multimodal chunks format"
+        )
+        return chunks
+
+    def _apply_chunk_template(
+        self, content_type: str, original_item: Dict[str, Any], description: str
+    ) -> str:
+        """
+        Apply the appropriate chunk template based on content type
+
+        Args:
+            content_type: Type of content (image, table, equation, generic)
+            original_item: Original multimodal item data
+            description: Enhanced description generated by the processor
+
+        Returns:
+            Formatted chunk content using the appropriate template
+        """
+        from raganything.prompt import PROMPTS
+
+        try:
+            if content_type == "image":
+                image_path = original_item.get("img_path", "")
+                captions = original_item.get(
+                    "image_caption", original_item.get("img_caption", [])
+                )
+                footnotes = original_item.get(
+                    "image_footnote", original_item.get("img_footnote", [])
+                )
+
+                return PROMPTS["image_chunk"].format(
+                    image_path=image_path,
+                    captions=", ".join(captions) if captions else "None",
+                    footnotes=", ".join(footnotes) if footnotes else "None",
+                    enhanced_caption=description,
+                )
+
+            elif content_type == "table":
+                table_img_path = original_item.get("img_path", "")
+                table_caption = original_item.get("table_caption", [])
+                table_body = original_item.get("table_body", "")
+                table_footnote = original_item.get("table_footnote", [])
+
+                return PROMPTS["table_chunk"].format(
+                    table_img_path=table_img_path,
+                    table_caption=", ".join(table_caption) if table_caption else "None",
+                    table_body=table_body,
+                    table_footnote=", ".join(table_footnote)
+                    if table_footnote
+                    else "None",
+                    enhanced_caption=description,
+                )
+
+            elif content_type == "equation":
+                equation_text = original_item.get("text", "")
+                equation_format = original_item.get("text_format", "")
+
+                return PROMPTS["equation_chunk"].format(
+                    equation_text=equation_text,
+                    equation_format=equation_format,
+                    enhanced_caption=description,
+                )
+
+            else:  # generic or unknown types
+                content = str(original_item.get("content", original_item))
+
+                return PROMPTS["generic_chunk"].format(
+                    content_type=content_type.title(),
+                    content=content,
+                    enhanced_caption=description,
+                )
+
+        except Exception as e:
+            self.logger.warning(
+                f"Error applying chunk template for {content_type}: {e}"
+            )
+            # Fallback to just the description if template fails
+            return description
+
+    async def _store_chunks_to_lightrag_storage_type_aware(
+        self, chunks: Dict[str, Any]
+    ):
+        """Store chunks to storage"""
+        try:
+            # Store in text_chunks storage (required for extract_entities)
+            await self.lightrag.text_chunks.upsert(chunks)
+
+            # Store in chunks vector database for retrieval
+            await self.lightrag.chunks_vdb.upsert(chunks)
+
+            self.logger.debug(f"Stored {len(chunks)} multimodal chunks to storage")
+
+        except Exception as e:
+            self.logger.error(f"Error storing chunks to storage: {e}")
+            raise
+
+    async def _store_multimodal_main_entities(
+        self,
+        multimodal_data_list: List[Dict[str, Any]],
+        lightrag_chunks: Dict[str, Any],
+        file_path: str,
+        doc_id: str = None,
+    ):
+        """
+        Store multimodal main entities to entities_vdb and full_entities.
+        This ensures that entities like "TableName (table)" are properly indexed.
+
+        Args:
+            multimodal_data_list: List of processed multimodal data with entity info
+            lightrag_chunks: Chunks in LightRAG format (already formatted with templates)
+            file_path: File path for the entities
+            doc_id: Document ID for full_entities storage
+        """
+        if not multimodal_data_list:
+            return
+
+        # Create entities_vdb entries for all multimodal main entities
+        entities_to_store = {}
+
+        # Use full path or basename based on config
+        file_ref = self._get_file_reference(file_path)
+
+        for data in multimodal_data_list:
+            entity_info = data["entity_info"]
+            entity_name = entity_info["entity_name"]
+            description = data["description"]
+            content_type = data["content_type"]
+            original_item = data["original_item"]
+
+            # Apply the same chunk template to get the formatted content
+            formatted_chunk_content = self._apply_chunk_template(
+                content_type, original_item, description
+            )
+
+            # Generate chunk_id using the formatted content (same as in _convert_to_lightrag_chunks)
+            chunk_id = compute_mdhash_id(formatted_chunk_content, prefix="chunk-")
+
+            # Generate entity_id using LightRAG's standard format
+            entity_id = compute_mdhash_id(entity_name, prefix="ent-")
+
+            # Create entity data in LightRAG format
+            entity_data = {
+                "entity_name": entity_name,
+                "entity_type": entity_info.get("entity_type", content_type),
+                "content": entity_info.get("summary", description),
+                "source_id": chunk_id,
+                "file_path": file_ref,
+            }
+
+            entities_to_store[entity_id] = entity_data
+
+        if entities_to_store:
+            try:
+                # Store entities in knowledge graph
+                for entity_id, entity_data in entities_to_store.items():
+                    entity_name = entity_data["entity_name"]
+
+                    # Create node data for knowledge graph
+                    node_data = {
+                        "entity_id": entity_name,
+                        "entity_type": entity_data["entity_type"],
+                        "description": entity_data["content"],
+                        "source_id": entity_data["source_id"],
+                        "file_path": entity_data["file_path"],
+                        "created_at": int(time.time()),
+                    }
+
+                    # Store in knowledge graph
+                    await self.lightrag.chunk_entity_relation_graph.upsert_node(
+                        entity_name, node_data
+                    )
+
+                # Store in entities_vdb
+                await self.lightrag.entities_vdb.upsert(entities_to_store)
+                await self.lightrag.entities_vdb.index_done_callback()
+
+                # NEW: Store multimodal main entities in full_entities storage
+                if doc_id and self.lightrag.full_entities:
+                    await self._store_multimodal_entities_to_full_entities(
+                        entities_to_store, doc_id
+                    )
+
+                self.logger.debug(
+                    f"Stored {len(entities_to_store)} multimodal main entities to knowledge graph, entities_vdb, and full_entities"
+                )
+
+            except Exception as e:
+                self.logger.error(f"Error storing multimodal main entities: {e}")
+                raise
+
+    async def _store_multimodal_entities_to_full_entities(
+        self, entities_to_store: Dict[str, Any], doc_id: str
+    ):
+        """
+        Store multimodal main entities to full_entities storage.
+
+        Args:
+            entities_to_store: Dictionary of entities to store
+            doc_id: Document ID for grouping entities
+        """
+        try:
+            # Get current full_entities data for this document
+            current_doc_entities = await self.lightrag.full_entities.get_by_id(doc_id)
+
+            if current_doc_entities is None:
+                # Create new document entry
+                entity_names = list(
+                    entity_data["entity_name"]
+                    for entity_data in entities_to_store.values()
+                )
+                doc_entities_data = {
+                    "entity_names": entity_names,
+                    "count": len(entity_names),
+                    "update_time": int(time.time()),
+                }
+            else:
+                # Update existing document entry
+                existing_entity_names = set(
+                    current_doc_entities.get("entity_names", [])
+                )
+                new_entity_names = [
+                    entity_data["entity_name"]
+                    for entity_data in entities_to_store.values()
+                ]
+
+                # Add new multimodal entities to the list (avoid duplicates)
+                for entity_name in new_entity_names:
+                    existing_entity_names.add(entity_name)
+
+                doc_entities_data = {
+                    "entity_names": list(existing_entity_names),
+                    "count": len(existing_entity_names),
+                    "update_time": int(time.time()),
+                }
+
+            # Store updated data
+            await self.lightrag.full_entities.upsert({doc_id: doc_entities_data})
+            await self.lightrag.full_entities.index_done_callback()
+
+            self.logger.debug(
+                f"Added {len(entities_to_store)} multimodal main entities to full_entities for doc {doc_id}"
+            )
+
+        except Exception as e:
+            self.logger.error(
+                f"Error storing multimodal entities to full_entities: {e}"
+            )
+            raise
+
+    async def _batch_extract_entities_lightrag_style_type_aware(
+        self, lightrag_chunks: Dict[str, Any]
+    ) -> List[Tuple]:
+        """Use LightRAG's extract_entities for batch entity relation extraction"""
+        from lightrag.kg.shared_storage import (
+            get_namespace_data,
+            get_pipeline_status_lock,
+        )
+        from lightrag.operate import extract_entities
+
+        # Get pipeline status (consistent with LightRAG)
+        pipeline_status = await get_namespace_data("pipeline_status")
+        pipeline_status_lock = get_pipeline_status_lock()
+
+        # Directly use LightRAG's extract_entities
+        chunk_results = await extract_entities(
+            chunks=lightrag_chunks,
+            global_config=self.lightrag.__dict__,
+            pipeline_status=pipeline_status,
+            pipeline_status_lock=pipeline_status_lock,
+            llm_response_cache=self.lightrag.llm_response_cache,
+            text_chunks_storage=self.lightrag.text_chunks,
+        )
+
+        self.logger.info(
+            f"Extracted entities from {len(lightrag_chunks)} multimodal chunks"
+        )
+        return chunk_results
+
+    async def _batch_add_belongs_to_relations_type_aware(
+        self, chunk_results: List[Tuple], multimodal_data_list: List[Dict[str, Any]]
+    ) -> List[Tuple]:
+        """Add belongs_to relations for multimodal entities"""
+        # Create mapping from chunk_id to modal_entity_name
+        chunk_to_modal_entity = {}
+        chunk_to_file_path = {}
+
+        for data in multimodal_data_list:
+            description = data["description"]
+            content_type = data["content_type"]
+            original_item = data["original_item"]
+
+            # Use the same template formatting as in _convert_to_lightrag_chunks_type_aware
+            formatted_chunk_content = self._apply_chunk_template(
+                content_type, original_item, description
+            )
+            chunk_id = compute_mdhash_id(formatted_chunk_content, prefix="chunk-")
+
+            chunk_to_modal_entity[chunk_id] = data["entity_info"]["entity_name"]
+            chunk_to_file_path[chunk_id] = data.get("file_path", "multimodal_content")
+
+        enhanced_chunk_results = []
+        belongs_to_count = 0
+
+        for maybe_nodes, maybe_edges in chunk_results:
+            # Find corresponding modal_entity_name for this chunk
+            chunk_id = None
+            for nodes_dict in maybe_nodes.values():
+                if nodes_dict:
+                    chunk_id = nodes_dict[0].get("source_id")
+                    break
+
+            if chunk_id and chunk_id in chunk_to_modal_entity:
+                modal_entity_name = chunk_to_modal_entity[chunk_id]
+                file_path = chunk_to_file_path.get(chunk_id, "multimodal_content")
+
+                # Add belongs_to relations for all extracted entities
+                for entity_name in maybe_nodes.keys():
+                    if entity_name != modal_entity_name:  # Avoid self-relation
+                        belongs_to_relation = {
+                            "src_id": entity_name,
+                            "tgt_id": modal_entity_name,
+                            "description": f"Entity {entity_name} belongs to {modal_entity_name}",
+                            "keywords": "belongs_to,part_of,contained_in",
+                            "source_id": chunk_id,
+                            "weight": 10.0,
+                            "file_path": file_path,
+                        }
+
+                        # Add to maybe_edges
+                        edge_key = (entity_name, modal_entity_name)
+                        if edge_key not in maybe_edges:
+                            maybe_edges[edge_key] = []
+                        maybe_edges[edge_key].append(belongs_to_relation)
+                        belongs_to_count += 1
+
+            enhanced_chunk_results.append((maybe_nodes, maybe_edges))
+
+        self.logger.info(
+            f"Added {belongs_to_count} belongs_to relations for multimodal entities"
+        )
+        return enhanced_chunk_results
+
+    async def _batch_merge_lightrag_style_type_aware(
+        self, enhanced_chunk_results: List[Tuple], file_path: str, doc_id: str = None
+    ):
+        """Use LightRAG's merge_nodes_and_edges for batch merge"""
+        from lightrag.kg.shared_storage import (
+            get_namespace_data,
+            get_pipeline_status_lock,
+        )
+        from lightrag.operate import merge_nodes_and_edges
+
+        pipeline_status = await get_namespace_data("pipeline_status")
+        pipeline_status_lock = get_pipeline_status_lock()
+
+        # Use full path or basename based on config
+        file_ref = self._get_file_reference(file_path)
+
+        await merge_nodes_and_edges(
+            chunk_results=enhanced_chunk_results,
+            knowledge_graph_inst=self.lightrag.chunk_entity_relation_graph,
+            entity_vdb=self.lightrag.entities_vdb,
+            relationships_vdb=self.lightrag.relationships_vdb,
+            global_config=self.lightrag.__dict__,
+            full_entities_storage=self.lightrag.full_entities,
+            full_relations_storage=self.lightrag.full_relations,
+            doc_id=doc_id,
+            pipeline_status=pipeline_status,
+            pipeline_status_lock=pipeline_status_lock,
+            llm_response_cache=self.lightrag.llm_response_cache,
+            current_file_number=1,
+            total_files=1,
+            file_path=file_ref,
+        )
+
+        await self.lightrag._insert_done()
+
+    async def _update_doc_status_with_chunks_type_aware(
+        self, doc_id: str, chunk_ids: List[str]
+    ):
+        """Update document status with multimodal chunks"""
+        try:
+            # Get current document status
+            current_doc_status = await self.lightrag.doc_status.get_by_id(doc_id)
+
+            if current_doc_status:
+                existing_chunks_list = current_doc_status.get("chunks_list", [])
+                existing_chunks_count = current_doc_status.get("chunks_count", 0)
+
+                # Add multimodal chunks to the standard chunks_list
+                updated_chunks_list = existing_chunks_list + chunk_ids
+                updated_chunks_count = existing_chunks_count + len(chunk_ids)
+
+                # Update document status with integrated chunk list
+                await self.lightrag.doc_status.upsert(
+                    {
+                        doc_id: {
+                            **current_doc_status,  # Keep existing fields
+                            "chunks_list": updated_chunks_list,  # Integrated chunks list
+                            "chunks_count": updated_chunks_count,  # Updated total count
+                            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S+00:00"),
+                        }
+                    }
+                )
+
+                # Ensure doc_status update is persisted to disk
+                await self.lightrag.doc_status.index_done_callback()
+
+                self.logger.info(
+                    f"Updated doc_status: added {len(chunk_ids)} multimodal chunks to standard chunks_list "
+                    f"(total chunks: {updated_chunks_count})"
+                )
+
+        except Exception as e:
+            self.logger.warning(
+                f"Error updating doc_status with multimodal chunks: {e}"
+            )
+
+    async def _mark_multimodal_processing_complete(self, doc_id: str):
+        """Mark multimodal content processing as complete in the document status."""
+        try:
+            current_doc_status = await self.lightrag.doc_status.get_by_id(doc_id)
+            if current_doc_status:
+                await self.lightrag.doc_status.upsert(
+                    {
+                        doc_id: {
+                            **current_doc_status,
+                            "multimodal_processed": True,
+                            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S+00:00"),
+                        }
+                    }
+                )
+                await self.lightrag.doc_status.index_done_callback()
+                self.logger.debug(
+                    f"Marked multimodal content processing as complete for document {doc_id}"
+                )
+        except Exception as e:
+            self.logger.warning(
+                f"Error marking multimodal processing as complete for document {doc_id}: {e}"
+            )
+
+    async def is_document_fully_processed(self, doc_id: str) -> bool:
+        """
+        Check if a document is fully processed (both text and multimodal content).
+
+        Args:
+            doc_id: Document ID to check
+
+        Returns:
+            bool: True if both text and multimodal content are processed
+        """
+        try:
+            doc_status = await self.lightrag.doc_status.get_by_id(doc_id)
+            if not doc_status:
+                return False
+
+            text_processed = doc_status.get("status") == DocStatus.PROCESSED
+            multimodal_processed = doc_status.get("multimodal_processed", False)
+
+            return text_processed and multimodal_processed
+
+        except Exception as e:
+            self.logger.error(
+                f"Error checking document processing status for {doc_id}: {e}"
+            )
+            return False
+
+    async def get_document_processing_status(self, doc_id: str) -> Dict[str, Any]:
+        """
+        Get detailed processing status for a document.
+
+        Args:
+            doc_id: Document ID to check
+
+        Returns:
+            Dict with processing status details
+        """
+        try:
+            doc_status = await self.lightrag.doc_status.get_by_id(doc_id)
+            if not doc_status:
+                return {
+                    "exists": False,
+                    "text_processed": False,
+                    "multimodal_processed": False,
+                    "fully_processed": False,
+                    "chunks_count": 0,
+                }
+
+            text_processed = doc_status.get("status") == DocStatus.PROCESSED
+            multimodal_processed = doc_status.get("multimodal_processed", False)
+            fully_processed = text_processed and multimodal_processed
+
+            return {
+                "exists": True,
+                "text_processed": text_processed,
+                "multimodal_processed": multimodal_processed,
+                "fully_processed": fully_processed,
+                "chunks_count": doc_status.get("chunks_count", 0),
+                "chunks_list": doc_status.get("chunks_list", []),
+                "status": doc_status.get("status", ""),
+                "updated_at": doc_status.get("updated_at", ""),
+                "raw_status": doc_status,
+            }
+
+        except Exception as e:
+            self.logger.error(
+                f"Error getting document processing status for {doc_id}: {e}"
+            )
+            return {
+                "exists": False,
+                "error": str(e),
+                "text_processed": False,
+                "multimodal_processed": False,
+                "fully_processed": False,
+                "chunks_count": 0,
+            }
+
+    async def process_document_complete(
+        self,
+        file_path: str,
+        output_dir: str = None,
+        parse_method: str = None,
+        display_stats: bool = None,
+        split_by_character: str | None = None,
+        split_by_character_only: bool = False,
+        doc_id: str | None = None,
+        file_name: str | None = None,
+        **kwargs,
+    ):
+        """
+        Complete document processing workflow
+
+        Args:
+            file_path: Path to the file to process
+            output_dir: output directory (defaults to config.parser_output_dir)
+            parse_method: Parse method (defaults to config.parse_method)
+            display_stats: Whether to display content statistics (defaults to config.display_content_stats)
+            split_by_character: Optional character to split the text by
+            split_by_character_only: If True, split only by the specified character
+            doc_id: Optional document ID, if not provided will be generated from content
+            **kwargs: Additional parameters for parser (e.g., lang, device, start_page, end_page, formula, table, backend, source)
+        """
+        # Ensure LightRAG is initialized
+        await self._ensure_lightrag_initialized()
+
+        # Use config defaults if not provided
+        if output_dir is None:
+            output_dir = self.config.parser_output_dir
+        if parse_method is None:
+            parse_method = self.config.parse_method
+        if display_stats is None:
+            display_stats = self.config.display_content_stats
+
+        self.logger.info(f"Starting complete document processing: {file_path}")
+
+        # Step 1: Parse document
+        content_list, content_based_doc_id = await self.parse_document(
+            file_path, output_dir, parse_method, display_stats, **kwargs
+        )
+
+        # Use provided doc_id or fall back to content-based doc_id
+        if doc_id is None:
+            doc_id = content_based_doc_id
+
+        # Step 2: Separate text and multimodal content
+        text_content, multimodal_items = separate_content(content_list)
+
+        # Step 2.5: Set content source for context extraction in multimodal processing
+        if hasattr(self, "set_content_source_for_context") and multimodal_items:
+            self.logger.info(
+                "Setting content source for context-aware multimodal processing..."
+            )
+            self.set_content_source_for_context(
+                content_list, self.config.content_format
+            )
+
+        # Step 3: Insert pure text content with all parameters
+        if text_content.strip():
+            if file_name is None:
+                # Use full path or basename based on config
+                file_name = self._get_file_reference(file_path)
+            await insert_text_content(
+                self.lightrag,
+                input=text_content,
+                file_paths=file_name,
+                split_by_character=split_by_character,
+                split_by_character_only=split_by_character_only,
+                ids=doc_id,
+            )
+        else:
+            # Determine file reference even if no text content
+            if file_name is None:
+                file_name = self._get_file_reference(file_path)
+
+        # Step 4: Process multimodal content (using specialized processors)
+        if multimodal_items:
+            await self._process_multimodal_content(multimodal_items, file_name, doc_id)
+        else:
+            # If no multimodal content, mark multimodal processing as complete
+            # This ensures the document status properly reflects completion of all processing
+            await self._mark_multimodal_processing_complete(doc_id)
+            self.logger.debug(
+                f"No multimodal content found in document {doc_id}, marked multimodal processing as complete"
+            )
+
+        self.logger.info(f"Document {file_path} processing complete!")
+
+    async def process_document_complete_with_page_topics(
+        self,
+        file_path: str,
+        output_dir: str = None,
+        parse_method: str = None,
+        display_stats: bool = None,
+        split_by_character: str | None = None,
+        split_by_character_only: bool = False,
+        doc_id: str | None = None,
+        file_name: str | None = None,
+        use_llm_for_topics: bool = True,
+        topic_max_chars: int = 2000,
+        topic_cosine_threshold: float = 0.7,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        """
+        Complete document processing workflow with page-topic extraction and relation building.
+
+        This workflow includes:
+        1) parse document
+        2) extract page topics
+        3) build page-topic similarity relations
+        4) build entity-to-page-topic relations (text-only mapping)
+        5) process multimodal content
+
+        Args:
+            file_path: Path to the file to process
+            output_dir: Output directory (defaults to config.parser_output_dir)
+            parse_method: Parse method (defaults to config.parse_method)
+            display_stats: Whether to display content statistics (defaults to config.display_content_stats)
+            split_by_character: Optional character to split the text by
+            split_by_character_only: If True, split only by the specified character
+            doc_id: Optional document ID, if not provided will be generated from content
+            file_name: Optional file reference used for insertion/citation
+            use_llm_for_topics: Whether to use llm for page topic extraction
+            topic_max_chars: Max chars for each page topic extraction prompt
+            topic_cosine_threshold: Cosine threshold for page topic relation edge creation
+            **kwargs: Additional parser parameters
+
+        Returns:
+            Dict[str, Any]: Structured processing result for debugging/inspection.
+        """
+        ensure_result = await self._ensure_lightrag_initialized()
+        if isinstance(ensure_result, dict) and not ensure_result.get("success", True):
+            raise RuntimeError(
+                f"LightRAG 初始化失败: {ensure_result.get('error', 'unknown error')}"
+            )
+
+        if output_dir is None:
+            output_dir = self.config.parser_output_dir
+        if parse_method is None:
+            parse_method = self.config.parse_method
+        if display_stats is None:
+            display_stats = self.config.display_content_stats
+
+        self.logger.info(
+            f"Starting complete document processing with page topics: {file_path}"
+        )
+
+        content_list, content_based_doc_id = await self.parse_document(
+            file_path=file_path,
+            output_dir=output_dir,
+            parse_method=parse_method,
+            display_stats=display_stats,
+            **kwargs,
+        )
+        auto_doc_id = doc_id is None
+        if auto_doc_id:
+            doc_id = content_based_doc_id
+
+        hidden_expand_report: Dict[str, Any] = {
+            "enabled": False,
+            "status": "disabled",
+            "expanded_blocks": 0,
+        }
+        if getattr(self.config, "enable_hidden_expansion", True):
+            parse_cache_key = getattr(self, "_latest_parse_cache_key", None)
+            content_list, hidden_expand_report = await self.enrich_hidden_information(
+                content_list=content_list,
+                score_threshold=float(
+                    getattr(self.config, "hidden_expand_score_threshold", 0.55)
+                ),
+                max_items_per_page=int(
+                    getattr(self.config, "hidden_expand_max_items_per_page", 1)
+                ),
+                use_llm=bool(getattr(self.config, "hidden_expand_use_llm", True)),
+                max_chars=int(getattr(self.config, "hidden_expand_max_chars", 1200)),
+                cache_key=parse_cache_key,
+            )
+
+            if auto_doc_id and hidden_expand_report.get("expanded_blocks", 0) > 0:
+                doc_id = self._generate_content_based_doc_id(content_list)
+                self.logger.info(
+                    "Recomputed content-based doc_id after hidden-info expansion"
+                )
+
+        topics = await self.extract_page_topics(
+            content_list,
+            use_llm=use_llm_for_topics,
+            max_chars=topic_max_chars,
+        )
+
+        await self.build_page_topic_relations(
+            topics,
+            cosine_threshold=topic_cosine_threshold,
+            file_path=file_path,
+        )
+
+        await self.build_page_entity_topic_relations_text_only(
+            page_topics=topics,
+            content_list=content_list,
+            doc_id=doc_id,
+            file_path=file_path,
+        )
+
+        text_content, multimodal_items = separate_content(content_list)
+
+        if hasattr(self, "set_content_source_for_context") and multimodal_items:
+            self.set_content_source_for_context(content_list, self.config.content_format)
+
+        if file_name is None:
+            file_name = self._get_file_reference(file_path)
+
+        if multimodal_items:
+            await self._process_multimodal_content(multimodal_items, file_name, doc_id)
+        else:
+            await self._mark_multimodal_processing_complete(doc_id)
+            self.logger.debug(
+                f"No multimodal content found in document {doc_id}, marked multimodal processing as complete"
+            )
+
+        self.logger.info(
+            f"Document {file_path} processing with page topics complete!"
+        )
+
+        return {
+            "file_path": file_path,
+            "doc_id": doc_id,
+            "content_blocks": len(content_list),
+            "topics": topics,
+            "topics_count": len(topics),
+            "multimodal_count": len(multimodal_items),
+            "text_content_length": len(text_content),
+            "hidden_expand_report": hidden_expand_report,
+            "status": "completed",
+        }
+
+    async def process_document_complete_lightrag_api(
+        self,
+        file_path: str,
+        output_dir: str = None,
+        parse_method: str = None,
+        display_stats: bool = None,
+        split_by_character: str | None = None,
+        split_by_character_only: bool = False,
+        doc_id: str | None = None,
+        scheme_name: str | None = None,
+        parser: str | None = None,
+        **kwargs,
+    ):
+        """
+        API exclusively for LightRAG calls: Complete document processing workflow
+
+        Args:
+            file_path: Path to the file to process
+            output_dir: output directory (defaults to config.parser_output_dir)
+            parse_method: Parse method (defaults to config.parse_method)
+            display_stats: Whether to display content statistics (defaults to config.display_content_stats)
+            split_by_character: Optional character to split the text by
+            split_by_character_only: If True, split only by the specified character
+            doc_id: Optional document ID, if not provided will be generated from content
+            **kwargs: Additional parameters for parser (e.g., lang, device, start_page, end_page, formula, table, backend, source)
+        """
+        # Use full path or basename based on config
+        file_name = self._get_file_reference(file_path)
+        doc_pre_id = f"doc-pre-{file_name}"
+        pipeline_status = None
+        pipeline_status_lock = None
+
+        if parser:
+            self.config.parser = parser
+
+        current_doc_status = await self.lightrag.doc_status.get_by_id(doc_pre_id)
+
+        try:
+            # Ensure LightRAG is initialized
+            result = await self._ensure_lightrag_initialized()
+            if not result["success"]:
+                await self.lightrag.doc_status.upsert(
+                    {
+                        doc_pre_id: {
+                            **current_doc_status,
+                            "status": DocStatus.FAILED,
+                            "error_msg": result["error"],
+                        }
+                    }
+                )
+                return False
+
+            # Use config defaults if not provided
+            if output_dir is None:
+                output_dir = self.config.parser_output_dir
+            if parse_method is None:
+                parse_method = self.config.parse_method
+            if display_stats is None:
+                display_stats = self.config.display_content_stats
+
+            self.logger.info(f"Starting complete document processing: {file_path}")
+
+            # Initialize doc status
+            current_doc_status = await self.lightrag.doc_status.get_by_id(doc_pre_id)
+            if not current_doc_status:
+                await self.lightrag.doc_status.upsert(
+                    {
+                        doc_pre_id: {
+                            "status": DocStatus.READY,
+                            "content": "",
+                            "error_msg": "",
+                            "content_summary": "",
+                            "multimodal_content": [],
+                            "scheme_name": scheme_name,
+                            "content_length": 0,
+                            "created_at": "",
+                            "updated_at": "",
+                            "file_path": file_name,
+                        }
+                    }
+                )
+                current_doc_status = await self.lightrag.doc_status.get_by_id(
+                    doc_pre_id
+                )
+
+            from lightrag.kg.shared_storage import (
+                get_namespace_data,
+                get_pipeline_status_lock,
+            )
+
+            pipeline_status = await get_namespace_data("pipeline_status")
+            pipeline_status_lock = get_pipeline_status_lock()
+
+            # Set processing status
+            async with pipeline_status_lock:
+                pipeline_status.update({"scan_disabled": True})
+                pipeline_status["history_messages"].append("Now is not allowed to scan")
+
+            await self.lightrag.doc_status.upsert(
+                {
+                    doc_pre_id: {
+                        **current_doc_status,
+                        "status": DocStatus.HANDLING,
+                        "error_msg": "",
+                    }
+                }
+            )
+
+            content_list = []
+            content_based_doc_id = ""
+
+            try:
+                # Step 1: Parse document
+                content_list, content_based_doc_id = await self.parse_document(
+                    file_path, output_dir, parse_method, display_stats, **kwargs
+                )
+            except MineruExecutionError as e:
+                error_message = e.error_msg
+                if isinstance(e.error_msg, list):
+                    error_message = "\n".join(e.error_msg)
+                await self.lightrag.doc_status.upsert(
+                    {
+                        doc_pre_id: {
+                            **current_doc_status,
+                            "status": DocStatus.FAILED,
+                            "error_msg": error_message,
+                        }
+                    }
+                )
+                self.logger.info(
+                    f"Error processing document {file_path}: MineruExecutionError"
+                )
+                return False
+            except Exception as e:
+                await self.lightrag.doc_status.upsert(
+                    {
+                        doc_pre_id: {
+                            **current_doc_status,
+                            "status": DocStatus.FAILED,
+                            "error_msg": str(e),
+                        }
+                    }
+                )
+                self.logger.info(f"Error processing document {file_path}: {str(e)}")
+                return False
+
+            # Use provided doc_id or fall back to content-based doc_id
+            if doc_id is None:
+                doc_id = content_based_doc_id
+
+            # Step 2: Separate text and multimodal content
+            text_content, multimodal_items = separate_content(content_list)
+
+            # Step 2.5: Set content source for context extraction in multimodal processing
+            if hasattr(self, "set_content_source_for_context") and multimodal_items:
+                self.logger.info(
+                    "Setting content source for context-aware multimodal processing..."
+                )
+                self.set_content_source_for_context(
+                    content_list, self.config.content_format
+                )
+
+            # Step 3: Insert pure text content and multimodal content with all parameters
+            if text_content.strip():
+                await insert_text_content_with_multimodal_content(
+                    self.lightrag,
+                    input=text_content,
+                    multimodal_content=multimodal_items,
+                    file_paths=file_name,
+                    split_by_character=split_by_character,
+                    split_by_character_only=split_by_character_only,
+                    ids=doc_id,
+                    scheme_name=scheme_name,
+                )
+
+            self.logger.info(f"Document {file_path} processing completed successfully")
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Error processing document {file_path}: {str(e)}")
+            self.logger.debug("Exception details:", exc_info=True)
+
+            # Update doc status to Failed
+            await self.lightrag.doc_status.upsert(
+                {
+                    doc_pre_id: {
+                        **current_doc_status,
+                        "status": DocStatus.FAILED,
+                        "error_msg": str(e),
+                    }
+                }
+            )
+            await self.lightrag.doc_status.index_done_callback()
+
+            # Update pipeline status
+            if pipeline_status_lock and pipeline_status:
+                try:
+                    async with pipeline_status_lock:
+                        pipeline_status.update({"scan_disabled": False})
+                        error_msg = (
+                            f"RAGAnything processing failed for {file_name}: {str(e)}"
+                        )
+                        pipeline_status["latest_message"] = error_msg
+                        pipeline_status["history_messages"].append(error_msg)
+                        pipeline_status["history_messages"].append(
+                            "Now is allowed to scan"
+                        )
+                except Exception as pipeline_update_error:
+                    self.logger.error(
+                        f"Failed to update pipeline status: {pipeline_update_error}"
+                    )
+
+            return False
+
+        finally:
+            async with pipeline_status_lock:
+                pipeline_status.update({"scan_disabled": False})
+                pipeline_status["latest_message"] = (
+                    f"RAGAnything processing completed for {file_name}"
+                )
+                pipeline_status["history_messages"].append(
+                    f"RAGAnything processing completed for {file_name}"
+                )
+                pipeline_status["history_messages"].append("Now is allowed to scan")
+
+    async def insert_content_list(
+        self,
+        content_list: List[Dict[str, Any]],
+        file_path: str = "unknown_document",
+        split_by_character: str | None = None,
+        split_by_character_only: bool = False,
+        doc_id: str | None = None,
+        display_stats: bool = None,
+    ):
+        """
+        Insert content list directly without document parsing
+
+        Args:
+            content_list: Pre-parsed content list containing text and multimodal items.
+                         Each item should be a dictionary with the following structure:
+                         - Text: {"type": "text", "text": "content", "page_idx": 0}
+                         - Image: {"type": "image", "img_path": "/absolute/path/to/image.jpg",
+                                  "image_caption": ["caption"], "image_footnote": ["note"], "page_idx": 1}
+                         - Table: {"type": "table", "table_body": "markdown table",
+                                  "table_caption": ["caption"], "table_footnote": ["note"], "page_idx": 2}
+                         - Equation: {"type": "equation", "latex": "LaTeX formula",
+                                     "text": "description", "page_idx": 3}
+                         - Generic: {"type": "custom_type", "content": "any content", "page_idx": 4}
+            file_path: Reference file path/name for citation (defaults to "unknown_document")
+            split_by_character: Optional character to split the text by
+            split_by_character_only: If True, split only by the specified character
+            doc_id: Optional document ID, if not provided will be generated from content
+            display_stats: Whether to display content statistics (defaults to config.display_content_stats)
+
+        Note:
+            - img_path must be an absolute path to the image file
+            - page_idx represents the page number where the content appears (0-based indexing)
+            - Items are processed in the order they appear in the list
+        """
+        # Ensure LightRAG is initialized
+        await self._ensure_lightrag_initialized()
+
+        # Use config defaults if not provided
+        if display_stats is None:
+            display_stats = self.config.display_content_stats
+
+        self.logger.info(
+            f"Starting direct content list insertion for: {file_path} ({len(content_list)} items)"
+        )
+
+        # Generate doc_id based on content if not provided
+        if doc_id is None:
+            doc_id = self._generate_content_based_doc_id(content_list)
+
+        # Display content statistics if requested
+        if display_stats:
+            self.logger.info("\nContent Information:")
+            self.logger.info(f"* Total blocks in content_list: {len(content_list)}")
+
+            # Count elements by type
+            block_types: Dict[str, int] = {}
+            for block in content_list:
+                if isinstance(block, dict):
+                    block_type = block.get("type", "unknown")
+                    if isinstance(block_type, str):
+                        block_types[block_type] = block_types.get(block_type, 0) + 1
+
+            self.logger.info("* Content block types:")
+            for block_type, count in block_types.items():
+                self.logger.info(f"  - {block_type}: {count}")
+
+        # Step 1: Separate text and multimodal content
+        text_content, multimodal_items = separate_content(content_list)
+
+        # Step 1.5: Set content source for context extraction in multimodal processing
+        if hasattr(self, "set_content_source_for_context") and multimodal_items:
+            self.logger.info(
+                "Setting content source for context-aware multimodal processing..."
+            )
+            self.set_content_source_for_context(
+                content_list, self.config.content_format
+            )
+
+        # Step 2: Insert pure text content with all parameters
+        if text_content.strip():
+            # Use full path or basename based on config
+            file_ref = self._get_file_reference(file_path)
+            await insert_text_content(
+                self.lightrag,
+                input=text_content,
+                file_paths=file_ref,
+                split_by_character=split_by_character,
+                split_by_character_only=split_by_character_only,
+                ids=doc_id,
+            )
+        else:
+            # Determine file reference even if no text content
+            file_ref = self._get_file_reference(file_path)
+
+        # Step 3: Process multimodal content (using specialized processors)
+        if multimodal_items:
+            await self._process_multimodal_content(multimodal_items, file_ref, doc_id)
+        else:
+            # If no multimodal content, mark multimodal processing as complete
+            # This ensures the document status properly reflects completion of all processing
+            await self._mark_multimodal_processing_complete(doc_id)
+            self.logger.debug(
+                f"No multimodal content found in document {doc_id}, marked multimodal processing as complete"
+            )
+
+        self.logger.info(f"Content list insertion complete for: {file_path}")
