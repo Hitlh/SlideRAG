@@ -29,6 +29,8 @@
 
 ## 🎬 Demo Showcase
 
+Below are snapshots from example.pdf demonstrating SlideRAG's capabilities across various slide types and content structures:
+
 <table>
 <tr>
 <td><img src="./assets/example_03.png" width="100%" alt="Demo 3"></td>
