@@ -30,7 +30,7 @@
 ## 🎬 演示视频
 这段视频以产品化视角展示了 SlideRAG 的核心能力，并完整演示了用户侧使用流程：从上传课件、查看解析结果，到围绕 PPT 内容进行多轮问答。
 
-https://github.com/user-attachments/assets/87c95499-ddb1-447f-93fd-5af5e229f8e9
+https://github.com/user-attachments/assets/799cc769-162e-400a-bb84-af2db426ba61
 
 ## :sparkles: Key Features
 - 🖼️ **PPT 优先的多模态 RAG 管线**：使用统一多模态解析器与图检索 + 向量检索混合引擎，支持基于文本、图像、表格、公式的可溯源问答。

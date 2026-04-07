@@ -30,7 +30,7 @@
 ## 🎬 Demo Showcase
 This video gives a product-style walkthrough of SlideRAG, from file upload and index building to evidence-grounded Q&A.
 
-https://github.com/user-attachments/assets/87c95499-ddb1-447f-93fd-5af5e229f8e9
+https://github.com/user-attachments/assets/799cc769-162e-400a-bb84-af2db426ba61
 
 ## :sparkles: Key Features
 - 🖼️ **PPT-first multimodal RAG pipeline**: Uses a unified multimodal parser and a graph-and-vector hybrid retrieval engine to support grounded QA across text, images, tables, and equations.
