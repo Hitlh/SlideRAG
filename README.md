@@ -28,9 +28,27 @@
 📌 It is designed for two key learning scenarios: before-class preview and before-exam review.
 
 ## 🎬 Demo Showcase
-This video gives a product-style walkthrough of SlideRAG, from file upload and index building to evidence-grounded Q&A.
 
-https://github.com/user-attachments/assets/799cc769-162e-400a-bb84-af2db426ba61
+<table>
+<tr>
+<td><img src="./assets/example_03.png" width="100%" alt="Demo 3"></td>
+<td><img src="./assets/example_04.png" width="100%" alt="Demo 4"></td>
+<td><img src="./assets/example_05.png" width="100%" alt="Demo 5"></td>
+<td><img src="./assets/example_06.png" width="100%" alt="Demo 6"></td>
+</tr>
+<tr>
+<td><img src="./assets/example_07.png" width="100%" alt="Demo 7"></td>
+<td><img src="./assets/example_08.png" width="100%" alt="Demo 8"></td>
+<td><img src="./assets/example_09.png" width="100%" alt="Demo 9"></td>
+<td><img src="./assets/example_10.png" width="100%" alt="Demo 10"></td>
+</tr>
+<tr>
+<td><img src="./assets/example_11.png" width="100%" alt="Demo 11"></td>
+<td><img src="./assets/example_12.png" width="100%" alt="Demo 12"></td>
+<td><img src="./assets/example_13.png" width="100%" alt="Demo 13"></td>
+<td><img src="./assets/example_14.png" width="100%" alt="Demo 14"></td>
+</tr>
+</table>
 
 ## :sparkles: Key Features
 - 🖼️ **PPT-first multimodal RAG pipeline**: Uses a unified multimodal parser and a graph-and-vector hybrid retrieval engine to support grounded QA across text, images, tables, and equations.
