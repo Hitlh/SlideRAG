@@ -52,6 +52,17 @@ Below are snapshots from example.pdf demonstrating SlideRAG's capabilities acros
 </tr>
 </table>
 
+QA case snapshots:
+
+<table>
+<tr>
+<td><img src="./assets/qa_case_01.png" width="100%" alt="QA Case 1"></td>
+<td><img src="./assets/qa_case_02.png" width="100%" alt="QA Case 2"></td>
+<td><img src="./assets/qa_case_03.png" width="100%" alt="QA Case 3"></td>
+<td><img src="./assets/qa_case_04.png" width="100%" alt="QA Case 4"></td>
+</tr>
+</table>
+
 ## :sparkles: Key Features
 - 🖼️ **PPT-first multimodal RAG pipeline**: Uses a unified multimodal parser and a graph-and-vector hybrid retrieval engine to support grounded QA across text, images, tables, and equations.
 - 🪄 **Hidden-information expansion for concise slides**: Detects high-compression pages and expands implicit content into grounded explanatory text.
