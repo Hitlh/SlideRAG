@@ -31,7 +31,7 @@
 
 This video presents SlideRAG from a product perspective and walks through the full user flow: upload slides, inspect parsing results, and run multi-turn QA over PPT content.
 
-https://github.com/user-attachments/assets/799cc769-162e-400a-bb84-af2db426ba61
+https://github.com/user-attachments/assets/09f12095-fb4e-4cf7-8bc1-ea148d23add9
 
 Here is an example that demonstrates the performance of SlideRAG in understanding the content and structure of multimodal slides:
 

@@ -31,7 +31,7 @@
 
 这段视频以产品化视角展示了 SlideRAG 的核心能力，并完整演示了用户侧使用流程：从上传课件、查看解析结果，到围绕 PPT 内容进行多轮问答。
 
-https://github.com/user-attachments/assets/799cc769-162e-400a-bb84-af2db426ba61
+https://github.com/user-attachments/assets/09f12095-fb4e-4cf7-8bc1-ea148d23add9
 
 以下是一个例子，展示了 SlideRAG 在多模态幻灯片内容和结构理解方面的功能表现：
 
