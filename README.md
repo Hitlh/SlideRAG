@@ -29,6 +29,10 @@
 
 ## 🎬 Demo Showcase
 
+This video presents SlideRAG from a product perspective and walks through the full user flow: upload slides, inspect parsing results, and run multi-turn QA over PPT content.
+
+https://github.com/user-attachments/assets/799cc769-162e-400a-bb84-af2db426ba61
+
 Below are snapshots from example.pdf demonstrating SlideRAG's capabilities across various slide types and content structures:
 
 <table>
