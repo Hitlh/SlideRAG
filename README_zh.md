@@ -33,7 +33,7 @@
 
 https://github.com/user-attachments/assets/799cc769-162e-400a-bb84-af2db426ba61
 
-以下是来自 `example.pdf` 的页面截图，展示 SlideRAG 在不同页面类型和内容结构下的处理效果：
+以下是一个例子，展示了 SlideRAG 在多模态幻灯片内容和结构理解方面的功能表现：
 
 <table>
 <tr>

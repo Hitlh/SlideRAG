@@ -33,7 +33,7 @@ This video presents SlideRAG from a product perspective and walks through the fu
 
 https://github.com/user-attachments/assets/799cc769-162e-400a-bb84-af2db426ba61
 
-Below are snapshots from example.pdf demonstrating SlideRAG's capabilities across various slide types and content structures:
+Here is an example that demonstrates the performance of SlideRAG in understanding the content and structure of multimodal slides:
 
 <table>
 <tr>
