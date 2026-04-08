@@ -109,6 +109,12 @@ Create a `.env` file by copying content from `env.project.example`, then fill in
 
 > Note: If you want to tune advanced parser/context behavior (for example, `SUMMARY_LANGUAGE`, hidden-expansion options, and context window settings), edit the **Advanced parser/context options (optional)** section in `env.project.example`.
 
+> Tip for users in mainland China: MinerU uses Hugging Face by default. If Hugging Face access is unstable, switch to ModelScope before running:
+>
+> ```bash
+> export MINERU_MODEL_SOURCE=modelscope
+> ```
+
 #### 2.1 API keys and base models
 ```env
 OPENAI_API_KEY=your_openai_api_key

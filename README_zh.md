@@ -32,6 +32,40 @@
 
 https://github.com/user-attachments/assets/799cc769-162e-400a-bb84-af2db426ba61
 
+以下是来自 `example.pdf` 的页面截图，展示 SlideRAG 在不同页面类型和内容结构下的处理效果：
+
+<table>
+<tr>
+<td><img src="./assets/example_03.png" width="100%" alt="Demo 3"></td>
+<td><img src="./assets/example_04.png" width="100%" alt="Demo 4"></td>
+<td><img src="./assets/example_05.png" width="100%" alt="Demo 5"></td>
+<td><img src="./assets/example_06.png" width="100%" alt="Demo 6"></td>
+</tr>
+<tr>
+<td><img src="./assets/example_07.png" width="100%" alt="Demo 7"></td>
+<td><img src="./assets/example_08.png" width="100%" alt="Demo 8"></td>
+<td><img src="./assets/example_09.png" width="100%" alt="Demo 9"></td>
+<td><img src="./assets/example_10.png" width="100%" alt="Demo 10"></td>
+</tr>
+<tr>
+<td><img src="./assets/example_11.png" width="100%" alt="Demo 11"></td>
+<td><img src="./assets/example_12.png" width="100%" alt="Demo 12"></td>
+<td><img src="./assets/example_13.png" width="100%" alt="Demo 13"></td>
+<td><img src="./assets/example_14.png" width="100%" alt="Demo 14"></td>
+</tr>
+</table>
+
+问答案例截图：
+
+<table>
+<tr>
+<td><img src="./assets/qa_case_01.png" width="100%" alt="QA Case 1"></td>
+<td><img src="./assets/qa_case_02.png" width="100%" alt="QA Case 2"></td>
+<td><img src="./assets/qa_case_03.png" width="100%" alt="QA Case 3"></td>
+<td><img src="./assets/qa_case_04.png" width="100%" alt="QA Case 4"></td>
+</tr>
+</table>
+
 ## :sparkles: Key Features
 - 🖼️ **PPT 优先的多模态 RAG 管线**：使用统一多模态解析器与图检索 + 向量检索混合引擎，支持基于文本、图像、表格、公式的可溯源问答。
 - 🪄 **面向“高压缩表达”页面的隐式信息扩展**：识别信息密度高、文字简略的页面，并补全为有依据的解释性内容。
@@ -77,6 +111,12 @@ pip install -e .[channels]
 将 `env.project.example` 的内容复制为 `.env` 文件，并填入你的密钥与模型配置。
 
 > 说明：如果你希望调整更高级的解析/上下文行为（例如 `SUMMARY_LANGUAGE`、隐式扩展选项、上下文窗口等），请编辑 `env.project.example` 中的 **Advanced parser/context options (optional)** 小节。
+
+> 国内用户提示：MinerU 默认使用 Hugging Face。若访问不稳定，可在运行前切换到 ModelScope：
+>
+> ```bash
+> export MINERU_MODEL_SOURCE=modelscope
+> ```
 
 #### 2.1 API Key 与基础模型
 ```env
