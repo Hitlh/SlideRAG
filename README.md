@@ -43,18 +43,8 @@ Here is an example that demonstrates the performance of SlideRAG in understandin
 </tr>
 <tr>
 <td><img src="./assets/example_06.png" width="100%" alt="Demo 6"></td>
-<td><img src="./assets/example_07.png" width="100%" alt="Demo 7"></td>
 <td><img src="./assets/example_08.png" width="100%" alt="Demo 8"></td>
-</tr>
-<tr>
 <td><img src="./assets/example_09.png" width="100%" alt="Demo 9"></td>
-<td><img src="./assets/example_10.png" width="100%" alt="Demo 10"></td>
-<td><img src="./assets/example_11.png" width="100%" alt="Demo 11"></td>
-</tr>
-<tr>
-<td><img src="./assets/example_12.png" width="100%" alt="Demo 12"></td>
-<td><img src="./assets/example_13.png" width="100%" alt="Demo 13"></td>
-<td><img src="./assets/example_14.png" width="100%" alt="Demo 14"></td>
 </tr>
 </table>
 
@@ -64,8 +54,6 @@ QA case snapshots:
 <tr>
 <td><img src="./assets/qa_case_01.png" width="100%" alt="QA Case 1"></td>
 <td><img src="./assets/qa_case_02.png" width="100%" alt="QA Case 2"></td>
-</tr>
-<tr>
 <td><img src="./assets/qa_case_03.png" width="100%" alt="QA Case 3"></td>
 <td><img src="./assets/qa_case_04.png" width="100%" alt="QA Case 4"></td>
 </tr>
