@@ -26,6 +26,14 @@ class BatchMixin:
     # Type hints for methods that will be available from other mixins
     async def _ensure_lightrag_initialized(self) -> None: ...
     async def process_document_complete(self, file_path: str, **kwargs) -> None: ...
+    async def parse_document(
+        self,
+        file_path: str,
+        output_dir: str = None,
+        parse_method: str = None,
+        display_stats: bool = None,
+        **kwargs,
+    ) -> tuple[List[Dict[str, Any]], str]: ...
 
     # ==========================================
     # ORIGINAL BATCH PROCESSING METHOD (RESTORED)
@@ -98,12 +106,20 @@ class BatchMixin:
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
 
-        # Process files with controlled concurrency
-        semaphore = asyncio.Semaphore(max_workers)
-        tasks = []
+        successful_files = []
+        failed_files = []
 
-        async def process_single_file(file_path: Path):
-            async with semaphore:
+        # Two-stage pipeline for MinerU:
+        # 1) parse serially to avoid GPU OOM on single-card setups
+        # 2) process page topics and multimodal content with user-defined concurrency
+        if self.config.parser == "mineru" and max_workers > 1:
+            self.logger.info(
+                "Using two-stage MinerU pipeline: serial parse + concurrent post-processing"
+            )
+
+            prepared_jobs: List[Dict[str, Any]] = []
+
+            for file_path in files_to_process:
                 is_in_subdir = (
                     lambda file_path, dir_path: len(
                         file_path.relative_to(dir_path).parents
@@ -111,51 +127,136 @@ class BatchMixin:
                     > 1
                 )(file_path, folder_path_obj)
 
+                current_output_dir = (
+                    output_dir
+                    if not is_in_subdir
+                    else str(output_path / file_path.parent.relative_to(folder_path_obj))
+                )
+                current_file_name = (
+                    None
+                    if not is_in_subdir
+                    else str(file_path.relative_to(folder_path_obj))
+                )
+
                 try:
-                    await self.process_document_complete(
-                        str(file_path),
-                        output_dir=(
-                            output_dir
-                            if not is_in_subdir
-                            else str(
-                                output_path
-                                / file_path.parent.relative_to(folder_path_obj)
-                            )
-                        ),
+                    content_list, content_based_doc_id = await self.parse_document(
+                        file_path=str(file_path),
+                        output_dir=current_output_dir,
                         parse_method=parse_method,
-                        split_by_character=split_by_character,
-                        split_by_character_only=split_by_character_only,
-                        file_name=(
-                            None
-                            if not is_in_subdir
-                            else str(file_path.relative_to(folder_path_obj))
-                        ),
+                        display_stats=display_stats,
                     )
-                    return True, str(file_path), None
+                    prepared_jobs.append(
+                        {
+                            "file_path": file_path,
+                            "output_dir": current_output_dir,
+                            "file_name": current_file_name,
+                            "content_list": content_list,
+                            "content_based_doc_id": content_based_doc_id,
+                            "parse_cache_key": getattr(
+                                self, "_latest_parse_cache_key", None
+                            ),
+                        }
+                    )
                 except Exception as e:
-                    self.logger.error(f"Failed to process {file_path}: {str(e)}")
-                    return False, str(file_path), str(e)
+                    self.logger.error(f"Failed to parse {file_path}: {str(e)}")
+                    failed_files.append((str(file_path), str(e)))
 
-        # Create tasks for all files
-        for file_path in files_to_process:
-            task = asyncio.create_task(process_single_file(file_path))
-            tasks.append(task)
+            semaphore = asyncio.Semaphore(max_workers)
 
-        # Wait for all tasks to complete
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+            async def process_preparsed_file(job: Dict[str, Any]):
+                async with semaphore:
+                    try:
+                        await self.process_document_complete_with_page_topics(
+                            str(job["file_path"]),
+                            output_dir=job["output_dir"],
+                            parse_method=parse_method,
+                            split_by_character=split_by_character,
+                            split_by_character_only=split_by_character_only,
+                            file_name=job["file_name"],
+                            pre_parsed_content_list=job["content_list"],
+                            pre_parsed_doc_id=job["content_based_doc_id"],
+                            pre_parsed_cache_key=job["parse_cache_key"],
+                        )
+                        return True, str(job["file_path"]), None
+                    except Exception as e:
+                        self.logger.error(
+                            f"Failed to post-process {job['file_path']}: {str(e)}"
+                        )
+                        return False, str(job["file_path"]), str(e)
 
-        # Process results
-        successful_files = []
-        failed_files = []
-        for result in results:
-            if isinstance(result, Exception):
-                failed_files.append(("unknown", str(result)))
-            else:
-                success, file_path, error = result
-                if success:
-                    successful_files.append(file_path)
+            tasks = [
+                asyncio.create_task(process_preparsed_file(job))
+                for job in prepared_jobs
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            for result in results:
+                if isinstance(result, Exception):
+                    failed_files.append(("unknown", str(result)))
                 else:
-                    failed_files.append((file_path, error))
+                    success, file_path, error = result
+                    if success:
+                        successful_files.append(file_path)
+                    else:
+                        failed_files.append((file_path, error))
+
+        else:
+            # Original one-stage flow
+            semaphore = asyncio.Semaphore(max_workers)
+            tasks = []
+
+            async def process_single_file(file_path: Path):
+                async with semaphore:
+                    is_in_subdir = (
+                        lambda file_path, dir_path: len(
+                            file_path.relative_to(dir_path).parents
+                        )
+                        > 1
+                    )(file_path, folder_path_obj)
+
+                    try:
+                        await self.process_document_complete_with_page_topics(
+                            str(file_path),
+                            output_dir=(
+                                output_dir
+                                if not is_in_subdir
+                                else str(
+                                    output_path
+                                    / file_path.parent.relative_to(folder_path_obj)
+                                )
+                            ),
+                            parse_method=parse_method,
+                            split_by_character=split_by_character,
+                            split_by_character_only=split_by_character_only,
+                            file_name=(
+                                None
+                                if not is_in_subdir
+                                else str(file_path.relative_to(folder_path_obj))
+                            ),
+                        )
+                        return True, str(file_path), None
+                    except Exception as e:
+                        self.logger.error(f"Failed to process {file_path}: {str(e)}")
+                        return False, str(file_path), str(e)
+
+            # Create tasks for all files
+            for file_path in files_to_process:
+                task = asyncio.create_task(process_single_file(file_path))
+                tasks.append(task)
+
+            # Wait for all tasks to complete
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            # Process results
+            for result in results:
+                if isinstance(result, Exception):
+                    failed_files.append(("unknown", str(result)))
+                else:
+                    success, file_path, error = result
+                    if success:
+                        successful_files.append(file_path)
+                    else:
+                        failed_files.append((file_path, error))
 
         # Display statistics if requested
         if display_stats:

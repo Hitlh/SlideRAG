@@ -1192,6 +1192,8 @@ class ProcessorMixin:
         file_path: str,
         separator: str = "\n<<<PAGE_BREAK>>>\n",
         page_marker_re: str | re.Pattern = r"<<PAGE:(\d+)>>",
+        chunk_wait_timeout: float = 120.0,
+        chunk_wait_interval: float = 1.0,
     ) -> None:
         """
         Build relations between page entities and page topic entities (text-only).
@@ -1251,13 +1253,46 @@ class ProcessorMixin:
             file_paths=file_ref,
         )
 
-        doc_status = await self.lightrag.doc_status.get_by_id(doc_id)
+        deadline = time.time() + float(chunk_wait_timeout)
+        doc_status = None
+        chunk_ids: List[str] = []
+        while time.time() < deadline:
+            doc_status = await self.lightrag.doc_status.get_by_id(doc_id)
+            if doc_status:
+                chunk_ids = doc_status.get("chunks_list", []) or []
+                status_value = doc_status.get("status")
+                if status_value == DocStatus.PROCESSED and chunk_ids:
+                    break
+            await asyncio.sleep(float(chunk_wait_interval))
+
         if not doc_status:
             raise RuntimeError("无法获取 doc_status，请确认文本已成功插入")
 
-        chunk_ids = doc_status.get("chunks_list", [])
-        if not chunk_ids:
-            raise RuntimeError("doc_status 中没有 chunks_list，无法建立页映射")
+        status_value = doc_status.get("status")
+        if status_value != DocStatus.PROCESSED or not chunk_ids:
+            pipeline_debug = ""
+            try:
+                from lightrag.kg.shared_storage import get_namespace_data
+
+                pipeline_status = await get_namespace_data(
+                    "pipeline_status", workspace=getattr(self.lightrag, "workspace", "")
+                )
+                if isinstance(pipeline_status, dict):
+                    pipeline_debug = (
+                        f"; pipeline_status={{busy:{pipeline_status.get('busy')}, "
+                        f"request_pending:{pipeline_status.get('request_pending')}, "
+                        f"job_name:{pipeline_status.get('job_name')}, "
+                        f"latest_message:{pipeline_status.get('latest_message')}}}"
+                    )
+            except Exception:
+                pass
+
+            raise RuntimeError(
+                "等待文本入库超时：doc_status 尚未达到 PROCESSED 且 chunks_list 非空，"
+                "文本插入可能仍在 LightRAG 队列中排队"
+                f" (doc_id={doc_id}, status={status_value}, chunks={len(chunk_ids)})"
+                f"{pipeline_debug}"
+            )
 
         chunk_to_page: Dict[str, int] = {}
         for chunk_id in chunk_ids:
@@ -2772,6 +2807,9 @@ class ProcessorMixin:
         use_llm_for_topics: bool = True,
         topic_max_chars: int = 2000,
         topic_cosine_threshold: float = 0.7,
+        pre_parsed_content_list: List[Dict[str, Any]] | None = None,
+        pre_parsed_doc_id: str | None = None,
+        pre_parsed_cache_key: str | None = None,
         **kwargs,
     ) -> Dict[str, Any]:
         """
@@ -2818,13 +2856,22 @@ class ProcessorMixin:
             f"Starting complete document processing with page topics: {file_path}"
         )
 
-        content_list, content_based_doc_id = await self.parse_document(
-            file_path=file_path,
-            output_dir=output_dir,
-            parse_method=parse_method,
-            display_stats=display_stats,
-            **kwargs,
-        )
+        if pre_parsed_content_list is None:
+            content_list, content_based_doc_id = await self.parse_document(
+                file_path=file_path,
+                output_dir=output_dir,
+                parse_method=parse_method,
+                display_stats=display_stats,
+                **kwargs,
+            )
+            parse_cache_key = getattr(self, "_latest_parse_cache_key", None)
+        else:
+            content_list = pre_parsed_content_list
+            content_based_doc_id = pre_parsed_doc_id or self._generate_content_based_doc_id(
+                content_list
+            )
+            parse_cache_key = pre_parsed_cache_key
+
         auto_doc_id = doc_id is None
         if auto_doc_id:
             doc_id = content_based_doc_id
@@ -2835,7 +2882,6 @@ class ProcessorMixin:
             "expanded_blocks": 0,
         }
         if getattr(self.config, "enable_hidden_expansion", True):
-            parse_cache_key = getattr(self, "_latest_parse_cache_key", None)
             content_list, hidden_expand_report = await self.enrich_hidden_information(
                 content_list=content_list,
                 score_threshold=float(
