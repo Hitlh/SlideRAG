@@ -2714,6 +2714,9 @@ class ProcessorMixin:
         split_by_character_only: bool = False,
         doc_id: str | None = None,
         file_name: str | None = None,
+        pre_parsed_content_list: List[Dict[str, Any]] | None = None,
+        pre_parsed_doc_id: str | None = None,
+        pre_parsed_cache_key: str | None = None,
         **kwargs,
     ):
         """
@@ -2742,10 +2745,16 @@ class ProcessorMixin:
 
         self.logger.info(f"Starting complete document processing: {file_path}")
 
-        # Step 1: Parse document
-        content_list, content_based_doc_id = await self.parse_document(
-            file_path, output_dir, parse_method, display_stats, **kwargs
-        )
+        # Step 1: Parse document or reuse pre-parsed content
+        if pre_parsed_content_list is None:
+            content_list, content_based_doc_id = await self.parse_document(
+                file_path, output_dir, parse_method, display_stats, **kwargs
+            )
+        else:
+            content_list = pre_parsed_content_list
+            content_based_doc_id = pre_parsed_doc_id or self._generate_content_based_doc_id(
+                content_list
+            )
 
         # Use provided doc_id or fall back to content-based doc_id
         if doc_id is None:

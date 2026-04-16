@@ -39,15 +39,18 @@ dependencies = [
 [project.scripts]
 sliderag-qq = "client.qq_runtime:main"
 sliderag-weixin = "client.weixin_runtime:main"
+sliderag-feishu = "client.feishu_runtime:main"
 
 [project.optional-dependencies]
 qq = ["qq-botpy"]
+feishu = ["lark-oapi"]
 weixin = [
     "httpx",
     "qrcode[pil]",
 ]
 channels = [
     "qq-botpy",
+    "lark-oapi",
     "httpx",
     "qrcode[pil]",
 ]

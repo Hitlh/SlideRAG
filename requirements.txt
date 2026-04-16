@@ -8,6 +8,7 @@ tqdm
 httpx
 qrcode[pil]
 anthropic
+lark-oapi
 # Note: Optional dependencies are now defined in setup.py extras_require:
 # - [image]: Pillow>=10.0.0 (for BMP, TIFF, GIF, WebP format conversion)
 # - [text]: reportlab>=4.0.0 (for TXT, MD to PDF conversion)
