@@ -37,9 +37,9 @@ dependencies = [
 ]
 
 [project.scripts]
-sliderag-qq = "client.qq_runtime:main"
-sliderag-weixin = "client.weixin_runtime:main"
-sliderag-feishu = "client.feishu_runtime:main"
+sliderag-qq = "client.qq.runtime:main"
+sliderag-weixin = "client.weixin.runtime:main"
+sliderag-feishu = "client.feishu.runtime:main"
 
 [project.optional-dependencies]
 qq = ["qq-botpy"]

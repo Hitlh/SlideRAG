@@ -170,12 +170,59 @@ QQ_STARTUP_NOTIFY_CHAT_ID=          # 启动通知目标会话/用户 ID
 7. 启动 QQ 后端：
 
 ```bash
-python3 client/qq_runtime.py
+python3 -m client.qq.runtime
 # 或
 sliderag-qq
 ```
 
 8. 开始聊天。可通过 `/file <filename>` 切换当前文档。
+
+### 飞书配置（需安装飞书扩展依赖）
+
+1. 进入飞书开放平台。中国区可使用 open.feishu.cn，海外区可使用 open.larksuite.com。
+2. 创建一个应用，并添加“机器人”能力。
+3. 在开发配置 > 权限管理中，开通消息相关权限：
+  - im:message
+  - im:message.p2p_msg:readonly
+4. 在开发配置 > 事件与回调中使用长连接接收事件，然后添加事件：
+  - im.message.receive_v1
+5. 在“凭证与基础信息”中保存 App ID 和 App Secret。
+6. 发布你的应用。
+7. 将要对话的文件放到目录中（默认：`./uploaded_docs`）。
+8. 配置飞书环境变量：
+
+```env
+FEISHU_ENABLED=true
+FEISHU_APP_ID=
+FEISHU_APP_SECRET=
+FEISHU_ENCRYPT_KEY=
+FEISHU_VERIFICATION_TOKEN=
+FEISHU_ALLOW_FROM=*
+# feishu（中国）| lark（海外）
+FEISHU_DOMAIN=feishu
+
+# 可选：启动时自动 ingest 的目标文件
+FEISHU_TARGET_FILE=
+
+# 运行目录
+FEISHU_UPLOADED_DOCS_DIR=./uploaded_docs
+FEISHU_INGEST_OUTPUT_DIR=./output
+FEISHU_RAG_WORKING_DIR=./rag_storage_by_feishu_file
+FEISHU_RUNTIME_STATE_DIR=./rag_storage_feishu_runtime
+
+# 启动就绪通知
+FEISHU_STARTUP_NOTIFY_ENABLED=true
+FEISHU_STARTUP_NOTIFY_MESSAGE=agent is ready.
+FEISHU_STARTUP_NOTIFY_CHAT_ID=
+```
+
+9. 启动飞书后端：
+
+```bash
+python3 -m client.feishu.runtime
+```
+
+10. 如果你要使用 `FEISHU_ALLOW_FROM` 或 `FEISHU_STARTUP_NOTIFY_CHAT_ID`，先在飞书里发一条消息，再到运行日志里查看 `sender_id`。
 
 ### WeChat setup（需安装微信扩展依赖）
 
@@ -195,9 +242,9 @@ WEIXIN_STARTUP_NOTIFY_CHAT_ID=     # 启动通知目标会话/用户 ID
 3. 启动微信后端：
 
 ```bash
-python3 client/weixin_runtime.py
+python3 -m client.weixin.runtime
 # 使用 -r 可强制重新登录
-python3 client/weixin_runtime.py -r
+python3 -m client.weixin.runtime -r
 ```
 
 4. 首次登录时扫码。

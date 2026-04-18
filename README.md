@@ -170,12 +170,59 @@ QQ_STARTUP_NOTIFY_CHAT_ID=          # Target chat/user ID for startup notificati
 7. Run QQ backend:
 
 ```bash
-python3 client/qq_runtime.py
+python3 -m client.qq.runtime
 # or
 sliderag-qq
 ```
 
 8. Start chatting. You can switch the active document with: `/file <filename>`.
+
+### Feishu setup (requires Feishu extras)
+
+1. Go to the Feishu/Lark open platform. China users can use open.feishu.cn, and global users can use open.larksuite.com.
+2. Create an app and add the Bot capability.
+3. In Developer Configuration > Permissions, enable the permissions needed for messaging:
+  - im:message
+  - im:message.p2p_msg:readonly
+4. In Developer Configuration > Events and Callbacks, use long connection for event delivery, then add the event:
+  - im.message.receive_v1
+5. Save the App ID and App Secret in Credentials & Basic Information.
+6. Publish the app.
+7. Put the files you want to chat with in a folder (default: `./uploaded_docs`).
+8. Configure Feishu environment variables:
+
+```env
+FEISHU_ENABLED=true
+FEISHU_APP_ID=
+FEISHU_APP_SECRET=
+FEISHU_ENCRYPT_KEY=
+FEISHU_VERIFICATION_TOKEN=
+FEISHU_ALLOW_FROM=*
+# feishu (China) | lark (global)
+FEISHU_DOMAIN=feishu
+
+# Optional startup target file for auto-ingest
+FEISHU_TARGET_FILE=
+
+# Runtime directories
+FEISHU_UPLOADED_DOCS_DIR=./uploaded_docs
+FEISHU_INGEST_OUTPUT_DIR=./output
+FEISHU_RAG_WORKING_DIR=./rag_storage_by_feishu_file
+FEISHU_RUNTIME_STATE_DIR=./rag_storage_feishu_runtime
+
+# Startup ready notification
+FEISHU_STARTUP_NOTIFY_ENABLED=true
+FEISHU_STARTUP_NOTIFY_MESSAGE=agent is ready.
+FEISHU_STARTUP_NOTIFY_CHAT_ID=
+```
+
+9. Run Feishu backend:
+
+```bash
+python3 -m client.feishu.runtime
+```
+
+10. Send one message in Feishu first if you want to use `FEISHU_ALLOW_FROM` or `FEISHU_STARTUP_NOTIFY_CHAT_ID`, then check runtime logs for the `sender_id` value.
 
 ### WeChat setup (requires WeChat extras)
 
@@ -195,9 +242,9 @@ WEIXIN_STARTUP_NOTIFY_CHAT_ID=     # Target chat/user ID for startup notificatio
 3. Run WeChat backend:
 
 ```bash
-python3 client/weixin_runtime.py
+python3 -m client.weixin.runtime
 # use -r to force re-login
-python3 client/weixin_runtime.py -r
+python3 -m client.weixin.runtime -r
 ```
 
 4. Scan QR code on first login.
