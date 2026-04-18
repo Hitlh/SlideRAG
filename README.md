@@ -13,7 +13,7 @@
     <img src="https://img.shields.io/badge/Python-3.10+-2b6cb0" alt="Python">
     <img src="https://img.shields.io/badge/RAG-Multimodal-0f766e" alt="Multimodal RAG">
     <img src="https://img.shields.io/badge/Agent-Tool%20Calling-b45309" alt="Agent Tool Calling">
-    <img src="https://img.shields.io/badge/Channels-Web%20%7C%20QQ%20%7C%20WeChat-334155" alt="Channels">
+    <img src="https://img.shields.io/badge/Channels-Web%20%7C%20QQ%20%7C%20WeChat%20%7C%20WhatsApp-334155" alt="Channels">
 </div>
 </div>
 
@@ -63,7 +63,7 @@ QA case snapshots:
 - 🖼️ **PPT-first multimodal RAG pipeline**: Uses a unified multimodal parser and a graph-and-vector hybrid retrieval engine to support grounded QA across text, images, tables, and equations.
 - 🪄 **Hidden-information expansion for concise slides**: Detects high-compression pages and expands implicit content into grounded explanatory text.
 - 🔗 **Page-topic extraction and structural linking**: Extracts per-page topics and links related slides to model section-level continuity in long decks.
-- 🤝 **Easy to use**: One backend supports Web, QQ, and WeChat, making the assistant accessible in familiar study workflows.
+- 🤝 **Easy to use**: One backend supports Web, QQ, WeChat, and WhatsApp bridge mode, making the assistant accessible in familiar study workflows.
 
 ## 🧩 Framework
 
@@ -74,11 +74,11 @@ SlideRAG follows a retrieval-augmented agent workflow:
 2. Perform PPT-oriented enhancement (hidden-info expansion + topic extraction/linking).
 3. Build unified multimodal knowledge storage for hybrid retrieval.
 4. Use tool-calling agent loop to retrieve evidence and trigger optional image understanding.
-5. Return grounded answers through Web/QQ/WeChat channels.
+5. Return grounded answers through Web/QQ/WeChat/WhatsApp channels.
 
 ## 🚀 Quick Start
 
-This section helps you run SlideRAG quickly for web usage, then optionally connect it to QQ or WeChat.
+This section helps you run SlideRAG quickly for web usage, then optionally connect it to QQ, WeChat, or WhatsApp.
 
 ### 1. Clone and install
 ```bash
@@ -91,6 +91,7 @@ pip install -e .
 # Optional channel dependencies
 pip install -e .[qq]
 pip install -e .[weixin]
+pip install -e .[whatsapp]
 pip install -e .[channels]
 ```
 
@@ -142,7 +143,7 @@ After startup, open the Streamlit URL shown in terminal and start asking questio
 
 ## Chat App Integration
 
-SlideRAG can run the same QA agent through QQ and WeChat.
+SlideRAG can run the same QA agent through QQ, WeChat, and WhatsApp bridge mode.
 
 ### QQ setup (requires QQ extras)
 
@@ -250,9 +251,67 @@ python3 -m client.weixin.runtime -r
 4. Scan QR code on first login.
 5. Start chatting. You can switch the active document with: `/file <filename>`.
 
+### WhatsApp setup (requires WhatsApp extras + local bridge)
+
+SlideRAG uses a local WebSocket bridge with protocol messages (`message/status/qr/error`, `send/send_media`).
+
+1. Start your local WhatsApp bridge (default endpoint: `ws://127.0.0.1:3001`) and keep it running.
+Example bridge startup:
+
+```bash
+cd /path/to/whatsapp-bridge
+npm install
+npm run build
+
+export BRIDGE_PORT=3001
+export BRIDGE_TOKEN=replace_with_secret
+export AUTH_DIR=/abs/path/to/wa_auth
+npm start
+```
+
+`BRIDGE_TOKEN` must be the same value as `WHATSAPP_BRIDGE_TOKEN` in SlideRAG `.env`.
+2. Configure WhatsApp environment variables:
+
+```env
+WHATSAPP_ENABLED=true
+WHATSAPP_ALLOW_FROM=*                      # Allowed sender/chat ids; use * to accept all
+WHATSAPP_BRIDGE_URL=ws://127.0.0.1:3001    # Local bridge endpoint
+WHATSAPP_BRIDGE_TOKEN=replace_with_secret  # Must match bridge auth token
+WHATSAPP_RECONNECT_DELAY_S=5
+WHATSAPP_SEND_RETRY_ATTEMPTS=3             # Outbound send retry attempts
+WHATSAPP_SEND_RETRY_DELAY_MS=400           # Outbound retry delay in milliseconds
+WHATSAPP_ACCEPT_GROUP_MESSAGES=true        # Accept group inbound messages
+WHATSAPP_REQUIRE_MENTION_IN_GROUP=true     # In group chats, reply only when bot is mentioned
+WHATSAPP_TARGET_FILE=                      # Optional; can switch via /file <filename>
+WHATSAPP_UPLOADED_DOCS_DIR=./uploaded_docs
+WHATSAPP_INGEST_OUTPUT_DIR=./output
+WHATSAPP_RAG_WORKING_DIR=./rag_storage_by_whatsapp_file
+WHATSAPP_RUNTIME_STATE_DIR=./rag_storage_whatsapp_runtime
+WHATSAPP_STARTUP_NOTIFY_ENABLED=true
+WHATSAPP_STARTUP_NOTIFY_MESSAGE=agent is ready.
+WHATSAPP_STARTUP_NOTIFY_CHAT_ID=
+```
+
+3. Run WhatsApp backend:
+
+```bash
+python3 client/whatsapp/runtime.py
+# or
+sliderag-whatsapp
+```
+
+4. Start chatting. Supported commands:
+- `/file <filename>` switch the active document
+- `/status` inspect runtime connection/queue/model status
+
+> If bridge shows repeated `Status: 408` / no QR code:
+> 1) verify WhatsApp Web is reachable from your runtime network,
+> 2) ensure bridge proxy config is effective in the same terminal process,
+> 3) ensure bridge keeps running (do not close after QR).
+
 ### How to set `ALLOW_FROM` and `STARTUP_NOTIFY_CHAT_ID`
 
-After you send one message in QQ/WeChat, check runtime logs for a line like:
+After you send one message in QQ/WeChat/WhatsApp, check runtime logs for a line like:
 
 ```text
 Inbound message: chat_id=..., sender_id=...

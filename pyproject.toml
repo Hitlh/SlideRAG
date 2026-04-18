@@ -40,6 +40,7 @@ dependencies = [
 sliderag-qq = "client.qq.runtime:main"
 sliderag-weixin = "client.weixin.runtime:main"
 sliderag-feishu = "client.feishu.runtime:main"
+sliderag-whatsapp = "client.whatsapp.runtime:main"
 
 [project.optional-dependencies]
 qq = ["qq-botpy"]
@@ -48,11 +49,15 @@ weixin = [
     "httpx",
     "qrcode[pil]",
 ]
+whatsapp = [
+    "websockets>=12.0",
+]
 channels = [
     "qq-botpy",
     "lark-oapi",
     "httpx",
     "qrcode[pil]",
+    "websockets>=12.0",
 ]
 
 [project.urls]

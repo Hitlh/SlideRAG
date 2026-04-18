@@ -13,7 +13,7 @@
     <img src="https://img.shields.io/badge/Python-3.10+-2b6cb0" alt="Python">
     <img src="https://img.shields.io/badge/RAG-Multimodal-0f766e" alt="Multimodal RAG">
     <img src="https://img.shields.io/badge/Agent-Tool%20Calling-b45309" alt="Agent Tool Calling">
-    <img src="https://img.shields.io/badge/Channels-Web%20%7C%20QQ%20%7C%20WeChat-334155" alt="Channels">
+    <img src="https://img.shields.io/badge/Channels-Web%20%7C%20QQ%20%7C%20WeChat%20%7C%20WhatsApp-334155" alt="Channels">
 </div>
 </div>
 
@@ -63,7 +63,7 @@ https://github.com/user-attachments/assets/09f12095-fb4e-4cf7-8bc1-ea148d23add9
 - 🖼️ **PPT 优先的多模态 RAG 管线**：使用统一多模态解析器与图检索 + 向量检索混合引擎，支持基于文本、图像、表格、公式的可溯源问答。
 - 🪄 **面向“高压缩表达”页面的隐式信息扩展**：识别信息密度高、文字简略的页面，并补全为有依据的解释性内容。
 - 🔗 **页面主题抽取与结构关联**：抽取页级主题并链接相关页面，建模长课件中的章节连续性。
-- 🤝 **易于使用**：同一后端支持 Web、QQ、微信，便于在熟悉的学习场景中直接使用。
+- 🤝 **易于使用**：同一后端支持 Web、QQ、微信、WhatsApp（Bridge 模式），便于在熟悉的学习场景中直接使用。
 
 ## 🧩 Framework
 
@@ -74,11 +74,11 @@ SlideRAG 采用检索增强的 Agent 工作流：
 2. 执行面向 PPT 的增强处理（隐式信息扩展 + 主题抽取与关联）。
 3. 构建统一多模态知识存储以支持混合检索。
 4. 通过工具调用循环检索证据，并按需触发二阶段图像理解。
-5. 通过 Web/QQ/微信通道返回有依据的回答。
+5. 通过 Web/QQ/微信/WhatsApp 通道返回有依据的回答。
 
 ## 🚀 快速开始
 
-本节帮助你先快速启动 Web 版本，再按需接入 QQ 或微信。
+本节帮助你先快速启动 Web 版本，再按需接入 QQ、微信或 WhatsApp。
 
 ### 1. 克隆并安装
 ```bash
@@ -91,6 +91,7 @@ pip install -e .
 # 可选渠道依赖
 pip install -e .[qq]
 pip install -e .[weixin]
+pip install -e .[whatsapp]
 pip install -e .[channels]
 ```
 
@@ -142,7 +143,7 @@ streamlit run client/app.py
 
 ## Chat App Integration
 
-SlideRAG 支持将同一问答 Agent 接入 QQ 与微信。
+SlideRAG 支持将同一问答 Agent 接入 QQ、微信与 WhatsApp（Bridge 模式）。
 
 ### QQ setup（需安装 QQ 扩展依赖）
 
@@ -250,9 +251,63 @@ python3 -m client.weixin.runtime -r
 4. 首次登录时扫码。
 5. 开始聊天。可通过 `/file <filename>` 切换当前文档。
 
+### WhatsApp setup（需安装 WhatsApp 扩展依赖 + 本地 Bridge）
+
+SlideRAG 的 WhatsApp 通道采用本地 WebSocket Bridge（协议消息：`message/status/qr/error`，`send/send_media`）。
+
+1. 启动本地 WhatsApp Bridge（默认地址 `ws://127.0.0.1:3001`），并保持进程常驻。
+Bridge 启动示例：
+
+```bash
+cd /path/to/whatsapp-bridge
+npm install
+npm run build
+
+export BRIDGE_PORT=3001
+export BRIDGE_TOKEN=replace_with_secret
+export AUTH_DIR=/abs/path/to/wa_auth
+npm start
+```
+
+其中 `BRIDGE_TOKEN` 必须与 SlideRAG `.env` 中的 `WHATSAPP_BRIDGE_TOKEN` 保持一致。
+2. 配置 WhatsApp 环境变量：
+
+```env
+WHATSAPP_ENABLED=true
+WHATSAPP_ALLOW_FROM=*                      # 允许的 sender/chat id，* 表示全部允许
+WHATSAPP_BRIDGE_URL=ws://127.0.0.1:3001    # 本地 Bridge 地址
+WHATSAPP_BRIDGE_TOKEN=replace_with_secret  # 必须与 Bridge 的 BRIDGE_TOKEN 一致
+WHATSAPP_RECONNECT_DELAY_S=5
+WHATSAPP_SEND_RETRY_ATTEMPTS=3             # 出站发送失败重试次数
+WHATSAPP_SEND_RETRY_DELAY_MS=400           # 出站重试间隔（毫秒）
+WHATSAPP_ACCEPT_GROUP_MESSAGES=true        # 是否接收群消息
+WHATSAPP_REQUIRE_MENTION_IN_GROUP=true     # 群聊中是否仅在被 @ 时回复
+WHATSAPP_TARGET_FILE=                      # 可选；默认文档，可通过 /file <filename> 切换
+WHATSAPP_UPLOADED_DOCS_DIR=./uploaded_docs
+WHATSAPP_INGEST_OUTPUT_DIR=./output
+WHATSAPP_RAG_WORKING_DIR=./rag_storage_by_whatsapp_file
+WHATSAPP_RUNTIME_STATE_DIR=./rag_storage_whatsapp_runtime
+WHATSAPP_STARTUP_NOTIFY_ENABLED=true
+WHATSAPP_STARTUP_NOTIFY_MESSAGE=agent is ready.
+WHATSAPP_STARTUP_NOTIFY_CHAT_ID=
+```
+
+3. 启动 WhatsApp 后端：
+
+```bash
+python3 client/whatsapp/runtime.py
+# 或
+sliderag-whatsapp
+```
+
+4. 开始聊天。支持：
+- 普通问答消息
+- `/file <filename>` 切换当前文档
+- `/status` 查看运行状态（bridge/whatsapp 连接、队列长度、当前模型与文档）
+
 ### 如何设置 `ALLOW_FROM` 与 `STARTUP_NOTIFY_CHAT_ID`
 
-在 QQ/微信先发送一条消息，然后查看运行日志中类似下面的内容：
+在 QQ/微信/WhatsApp 先发送一条消息，然后查看运行日志中类似下面的内容：
 
 ```text
 Inbound message: chat_id=..., sender_id=...

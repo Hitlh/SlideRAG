@@ -3,6 +3,7 @@
 from .base import BaseChannel
 from .feishu import FeishuChannel, FeishuConfig
 from .qq import QQChannel, QQConfig
+from .whatsapp import WhatsAppChannel, WhatsAppConfig
 from .weixin import WeixinChannel, WeixinConfig
 
 __all__ = [
@@ -13,4 +14,6 @@ __all__ = [
 	"WeixinConfig",
 	"FeishuChannel",
 	"FeishuConfig",
+	"WhatsAppChannel",
+	"WhatsAppConfig",
 ]
