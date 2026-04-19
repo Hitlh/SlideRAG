@@ -255,11 +255,11 @@ python3 -m client.weixin.runtime -r
 
 SlideRAG 的 WhatsApp 通道采用本地 WebSocket Bridge（协议消息：`message/status/qr/error`，`send/send_media`）。
 
-1. 启动本地 WhatsApp Bridge（默认地址 `ws://127.0.0.1:3001`），并保持进程常驻。
+1. 启动本仓库自带的本地 WhatsApp Bridge（默认地址 `ws://127.0.0.1:3001`），并保持进程常驻。
 Bridge 启动示例：
 
 ```bash
-cd /path/to/whatsapp-bridge
+cd /path/to/SlideRAG/bridge
 npm install
 npm run build
 
@@ -270,6 +270,8 @@ npm start
 ```
 
 其中 `BRIDGE_TOKEN` 必须与 SlideRAG `.env` 中的 `WHATSAPP_BRIDGE_TOKEN` 保持一致。
+> 温馨提示：如果你是用同一个 WhatsApp 账号给自己发消息做测试，
+> 启动 bridge 前请设置 `export WHATSAPP_ACCEPT_FROM_ME=true`。
 2. 配置 WhatsApp 环境变量：
 
 ```env
@@ -319,7 +321,6 @@ Inbound message: chat_id=..., sender_id=...
 | 项目 | 说明 | 链接 |
 |---|---|---|
 | **RAG-Anything** | RAG-Anything: All-in-One RAG Framework | [GitHub](https://github.com/HKUDS/RAG-Anything.git) |
-| **nanobot** | nanobot: The Ultra-Lightweight Personal AI Assistant | [GitHub](https://github.com/HKUDS/nanobot.git) |
 
 ## :hugs: Citation
 如果你觉得本项目对你有帮助，欢迎引用：

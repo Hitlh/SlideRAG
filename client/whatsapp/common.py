@@ -24,7 +24,7 @@ from client.runtime_common_shared import (
 from client.utils import get_env_bool, get_env_int, get_env_str, load_env_file
 from rag_agent.channels.whatsapp import WhatsAppConfig
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 WHATSAPP_SWITCH_REQUEST_FILE = "whatsapp_runtime_switch_request.json"
 
 

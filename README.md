@@ -255,11 +255,11 @@ python3 -m client.weixin.runtime -r
 
 SlideRAG uses a local WebSocket bridge with protocol messages (`message/status/qr/error`, `send/send_media`).
 
-1. Start your local WhatsApp bridge (default endpoint: `ws://127.0.0.1:3001`) and keep it running.
+1. Start the bundled local WhatsApp bridge in this repository (default endpoint: `ws://127.0.0.1:3001`) and keep it running.
 Example bridge startup:
 
 ```bash
-cd /path/to/whatsapp-bridge
+cd /path/to/SlideRAG/bridge
 npm install
 npm run build
 
@@ -270,6 +270,8 @@ npm start
 ```
 
 `BRIDGE_TOKEN` must be the same value as `WHATSAPP_BRIDGE_TOKEN` in SlideRAG `.env`.
+> Tip: If you test by sending messages from the same WhatsApp account (self-message),
+> start bridge with `export WHATSAPP_ACCEPT_FROM_ME=true`.
 2. Configure WhatsApp environment variables:
 
 ```env
@@ -323,7 +325,6 @@ Use the `sender_id` value for your allowlist and startup notification target.
 | Project | Description | Link |
 |---|---|---|
 | **RAG-Anything** | All-in-One RAG Framework | [GitHub](https://github.com/HKUDS/RAG-Anything.git) |
-| **nanobot** | Ultra-Lightweight Personal AI Assistant | [GitHub](https://github.com/HKUDS/nanobot.git) |
 
 ## :hugs: Citation
 If you find this project useful, please cite:

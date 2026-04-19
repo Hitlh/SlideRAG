@@ -83,6 +83,7 @@ CLAUDE.md
 # app
 uploaded_docs_registry.json
 uploaded_docs/
+bridge/node_modules/
 
 #test
 pptbench_tests
