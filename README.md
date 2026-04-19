@@ -13,7 +13,7 @@
     <img src="https://img.shields.io/badge/Python-3.10+-2b6cb0" alt="Python">
     <img src="https://img.shields.io/badge/RAG-Multimodal-0f766e" alt="Multimodal RAG">
     <img src="https://img.shields.io/badge/Agent-Tool%20Calling-b45309" alt="Agent Tool Calling">
-    <img src="https://img.shields.io/badge/Channels-Web%20%7C%20QQ%20%7C%20WeChat%20%7C%20WhatsApp-334155" alt="Channels">
+    <img src="https://img.shields.io/badge/Channels-Web%20%7C%20QQ%20%7C%20Feishu%20%7C%20WeChat%20%7C%20WhatsApp-334155" alt="Channels">
 </div>
 </div>
 
@@ -63,7 +63,7 @@ QA case snapshots:
 - 🖼️ **PPT-first multimodal RAG pipeline**: Uses a unified multimodal parser and a graph-and-vector hybrid retrieval engine to support grounded QA across text, images, tables, and equations.
 - 🪄 **Hidden-information expansion for concise slides**: Detects high-compression pages and expands implicit content into grounded explanatory text.
 - 🔗 **Page-topic extraction and structural linking**: Extracts per-page topics and links related slides to model section-level continuity in long decks.
-- 🤝 **Easy to use**: One backend supports Web, QQ, WeChat, and WhatsApp bridge mode, making the assistant accessible in familiar study workflows.
+- 🤝 **Easy to use**: One backend supports Web, QQ, Feishu, WeChat, and WhatsApp bridge mode, making the assistant accessible in familiar study workflows.
 
 ## 🧩 Framework
 
@@ -74,11 +74,11 @@ SlideRAG follows a retrieval-augmented agent workflow:
 2. Perform PPT-oriented enhancement (hidden-info expansion + topic extraction/linking).
 3. Build unified multimodal knowledge storage for hybrid retrieval.
 4. Use tool-calling agent loop to retrieve evidence and trigger optional image understanding.
-5. Return grounded answers through Web/QQ/WeChat/WhatsApp channels.
+5. Return grounded answers through Web/QQ/Feishu/WeChat/WhatsApp channels.
 
 ## 🚀 Quick Start
 
-This section helps you run SlideRAG quickly for web usage, then optionally connect it to QQ, WeChat, or WhatsApp.
+This section helps you run SlideRAG quickly for web usage, then optionally connect it to QQ, Feishu, WeChat, or WhatsApp.
 
 ### 1. Clone and install
 ```bash
@@ -90,6 +90,7 @@ pip install -e .
 
 # Optional channel dependencies
 pip install -e .[qq]
+pip install -e .[feishu]
 pip install -e .[weixin]
 pip install -e .[whatsapp]
 pip install -e .[channels]
@@ -143,7 +144,7 @@ After startup, open the Streamlit URL shown in terminal and start asking questio
 
 ## Chat App Integration
 
-SlideRAG can run the same QA agent through QQ, WeChat, and WhatsApp bridge mode.
+SlideRAG can run the same QA agent through QQ, Feishu, WeChat, and WhatsApp bridge mode.
 
 ### QQ setup (requires QQ extras)
 
