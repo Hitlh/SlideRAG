@@ -19,6 +19,7 @@
 
 ## :new: Updates
 - [04/2026] :fire: SlideRAG is now open-source.
+- [04/2026] :sparkles: Added Feishu and WhatsApp channels to bring the same SlideRAG agent to more chat platforms.
 
 ## :rocket: SlideRAG
 🎓 SlideRAG is an end-to-end assistant for understanding PPT/PPTX files as multimodal learning materials.

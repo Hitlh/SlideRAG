@@ -19,6 +19,7 @@
 
 ## :new: Updates
 - [04/2026] :fire: SlideRAG 已开源。
+- [04/2026] :sparkles: 新增飞书与 WhatsApp 渠道接入，让同一套 SlideRAG Agent 可运行在更多聊天平台。
 
 ## :rocket: SlideRAG
 🎓 SlideRAG 是一个面向演示文稿（PPT/PPTX）理解场景的端到端智能助手。
