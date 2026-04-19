@@ -84,6 +84,7 @@ CLAUDE.md
 uploaded_docs_registry.json
 uploaded_docs/
 bridge/node_modules/
+skills/
 
 #test
 pptbench_tests

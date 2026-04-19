@@ -321,6 +321,7 @@ Inbound message: chat_id=..., sender_id=...
 | 项目 | 说明 | 链接 |
 |---|---|---|
 | **RAG-Anything** | RAG-Anything: All-in-One RAG Framework | [GitHub](https://github.com/HKUDS/RAG-Anything.git) |
+| **nanobot** | nanobot: The Ultra-Lightweight Personal AI Assistant | [GitHub](https://github.com/HKUDS/nanobot.git) |
 
 ## :hugs: Citation
 如果你觉得本项目对你有帮助，欢迎引用：

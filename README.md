@@ -325,6 +325,7 @@ Use the `sender_id` value for your allowlist and startup notification target.
 | Project | Description | Link |
 |---|---|---|
 | **RAG-Anything** | All-in-One RAG Framework | [GitHub](https://github.com/HKUDS/RAG-Anything.git) |
+| **nanobot** | Ultra-Lightweight Personal AI Assistant | [GitHub](https://github.com/HKUDS/nanobot.git) |
 
 ## :hugs: Citation
 If you find this project useful, please cite:
