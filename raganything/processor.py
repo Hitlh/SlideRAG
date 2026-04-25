@@ -333,7 +333,8 @@ class ProcessorMixin:
 
         fn = self.llm_model_func
 
-        print("Calling LLM model function...")
+        #print("prompt:", prompt)
+        #print("system_prompt:", system_prompt)
 
         # Some callables do not accept history_messages, so try graceful fallbacks
         async def _invoke(with_history: bool):
@@ -920,112 +921,146 @@ class ProcessorMixin:
                 continue
             page_buckets.setdefault(page_key, []).append(item)
 
-        page_topics: Dict[int, str] = {}
+        page_indices = sorted(page_buckets.keys())
+        page_parallel_limit = getattr(
+            getattr(self, "config", None), "page_topic_max_async", None
+        )
+        if page_parallel_limit is None:
+            page_parallel_limit = getattr(self.lightrag, "max_parallel_insert", 2)
+        try:
+            page_parallel_limit = max(1, int(page_parallel_limit))
+        except (ValueError, TypeError):
+            page_parallel_limit = 2
+        page_semaphore = asyncio.Semaphore(page_parallel_limit)
+        page_topic_start_time = time.perf_counter()
 
-        for page_idx in sorted(page_buckets.keys()):
-            items = page_buckets[page_idx]
-            '''
-            header_candidates = [
-                i.get("text", "").strip()
-                for i in items
-                if i.get("type") == "header"
-                and isinstance(i.get("text"), str)
-                and i.get("text").strip()
+        async def _extract_single_page_topic(
+            page_idx: int, items: List[Dict[str, Any]]
+        ) -> tuple[int, str]:
+            async with page_semaphore:
+                '''
+                header_candidates = [
+                    i.get("text", "").strip()
+                    for i in items
+                    if i.get("type") == "header"
+                    and isinstance(i.get("text"), str)
+                    and i.get("text").strip()
+                ]
+                if header_candidates:
+                    page_topics[page_idx] = header_candidates[0]
+                    continue
+                '''
+
+                # First pass: collect page text context (text + list[text])
+                text_parts: List[str] = []
+                for i in items:
+                    if i.get("type") == "text" and isinstance(i.get("text"), str):
+                        text_parts.append(i["text"].strip())
+                    elif i.get("type") == "list" and i.get("sub_type") == "text":
+                        li = i.get("list_items", [])
+                        if isinstance(li, list) and li:
+                            # 连接列表项为上下文文本
+                            joined = "\n".join(
+                                [s.strip() for s in li if isinstance(s, str)]
+                            )
+                            if joined:
+                                text_parts.append(joined)
+
+                page_context = "\n".join([p for p in text_parts if p])
+                #print(f"Page {page_idx} context text: {page_context}")
+
+                # Second pass: handle images with context-aware description
+                image_parts: List[str] = []
+                image_tag = "Image" if summary_language == "English" else "图片"
+                caption_tag = "Caption" if summary_language == "English" else "图注"
+                footnote_tag = (
+                    "Footnotes" if summary_language == "English" else "脚注"
+                )
+                for i in items:
+                    if i.get("type") == "image":
+                        image_desc = await self._describe_image_for_topic(
+                            i, page_context, summary_language
+                        )
+                        if image_desc:
+                            image_parts.append(f"{image_tag}: {image_desc}")
+
+                        captions = i.get("image_caption") or i.get("img_caption") or []
+                        footnotes = i.get("image_footnote") or []
+
+                        if isinstance(captions, list):
+                            captions = " ".join(
+                                [c.strip() for c in captions if isinstance(c, str)]
+                            )
+                        if isinstance(footnotes, list):
+                            footnotes = " ".join(
+                                [f.strip() for f in footnotes if isinstance(f, str)]
+                            )
+
+                        if isinstance(captions, str) and captions.strip():
+                            image_parts.append(f"{caption_tag}: {captions.strip()}")
+                        if isinstance(footnotes, str) and footnotes.strip():
+                            image_parts.append(f"{footnote_tag}: {footnotes.strip()}")
+
+                page_text = "\n".join([p for p in text_parts + image_parts if p])
+
+                if summary_language == "English":
+                    fallback_topic = "Page_{0}".format(page_idx)
+                else:
+                    fallback_topic = "第{0}页".format(page_idx)
+                if text_parts:
+                    first_line = text_parts[0].splitlines()[0].strip()
+                    if first_line:
+                        fallback_topic = (
+                            first_line
+                            if len(first_line) <= 80
+                            else first_line[:77] + "..."
+                        )
+
+                if not page_text.strip():
+                    return page_idx, fallback_topic
+
+                if not effective_use_llm:
+                    return page_idx, fallback_topic
+
+                truncated_text = page_text[:max_chars]
+                prompt = PROMPTS["PAGE_TOPIC_PROMPT"].format(
+                    page_idx=page_idx,
+                    page_content=truncated_text,
+                    fallback_topic=fallback_topic,
+                )
+                if summary_language == "English":
+                    prompt += "\nLanguage requirement: The topic must be in English."
+                else:
+                    prompt += "\n语言要求：topic字段必须使用中文。"
+
+                try:
+                    response = await self._call_llm_model(
+                        prompt, system_prompt=PROMPTS["PAGE_TOPIC_SYSTEM"]
+                    )
+                    topic = self._parse_page_topic_response(response, fallback_topic)
+                    return page_idx, topic
+                except Exception as e:
+                    self.logger.warning(
+                        f"Failed to extract page topic for page {page_idx}: {e}"
+                    )
+                    return page_idx, fallback_topic
+
+        results = await asyncio.gather(
+            *[
+                _extract_single_page_topic(page_idx, page_buckets[page_idx])
+                for page_idx in page_indices
             ]
-            if header_candidates:
-                page_topics[page_idx] = header_candidates[0]
-                continue
-            '''
-
-            # First pass: collect page text context (text + list[text])
-            text_parts: List[str] = []
-            for i in items:
-                if i.get("type") == "text" and isinstance(i.get("text"), str):
-                    text_parts.append(i["text"].strip())
-                elif i.get("type") == "list" and i.get("sub_type") == "text":
-                    li = i.get("list_items", [])
-                    if isinstance(li, list) and li:
-                        # 连接列表项为上下文文本
-                        joined = "\n".join([s.strip() for s in li if isinstance(s, str)])
-                        if joined:
-                            text_parts.append(joined)
-
-            page_context = "\n".join([p for p in text_parts if p])
-            #print(f"Page {page_idx} context text: {page_context}")
-
-            # Second pass: handle images with context-aware description
-            image_parts: List[str] = []
-            image_tag = "Image" if summary_language == "English" else "图片"
-            caption_tag = "Caption" if summary_language == "English" else "图注"
-            footnote_tag = "Footnotes" if summary_language == "English" else "脚注"
-            for i in items:
-                if i.get("type") == "image":
-                    image_desc = await self._describe_image_for_topic(
-                        i, page_context, summary_language
-                    )
-                    if image_desc:
-                        image_parts.append(f"{image_tag}: {image_desc}")
-
-                    captions = i.get("image_caption") or i.get("img_caption") or []
-                    footnotes = i.get("image_footnote") or []
-
-                    if isinstance(captions, list):
-                        captions = " ".join(
-                            [c.strip() for c in captions if isinstance(c, str)]
-                        )
-                    if isinstance(footnotes, list):
-                        footnotes = " ".join(
-                            [f.strip() for f in footnotes if isinstance(f, str)]
-                        )
-
-                    if isinstance(captions, str) and captions.strip():
-                        image_parts.append(f"{caption_tag}: {captions.strip()}")
-                    if isinstance(footnotes, str) and footnotes.strip():
-                        image_parts.append(f"{footnote_tag}: {footnotes.strip()}")
-
-            page_text = "\n".join([p for p in text_parts + image_parts if p])
-
-            if summary_language == "English":
-                fallback_topic = "Page_{0}".format(page_idx)
-            else:
-                fallback_topic = "第{0}页".format(page_idx)
-            if text_parts:
-                first_line = text_parts[0].splitlines()[0].strip()
-                if first_line:
-                    fallback_topic = (
-                        first_line if len(first_line) <= 80 else first_line[:77] + "..."
-                    )
-
-            if not page_text.strip():
-                page_topics[page_idx] = fallback_topic
-                continue
-
-            if not effective_use_llm:
-                page_topics[page_idx] = fallback_topic
-                continue
-
-            truncated_text = page_text[:max_chars]
-            prompt = PROMPTS["PAGE_TOPIC_PROMPT"].format(
-                page_idx=page_idx,
-                page_content=truncated_text,
-                fallback_topic=fallback_topic,
-            )
-            if summary_language == "English":
-                prompt += "\nLanguage requirement: The topic must be in English."
-            else:
-                prompt += "\n语言要求：topic字段必须使用中文。"
-
-            try:
-                response = await self._call_llm_model(
-                    prompt, system_prompt=PROMPTS["PAGE_TOPIC_SYSTEM"]
-                )
-                topic = self._parse_page_topic_response(response, fallback_topic)
-                page_topics[page_idx] = topic
-            except Exception as e:
-                self.logger.warning(
-                    f"Failed to extract page topic for page {page_idx}: {e}"
-                )
-                page_topics[page_idx] = fallback_topic
+        )
+        page_topics = {page_idx: topic for page_idx, topic in results}
+        elapsed = time.perf_counter() - page_topic_start_time
+        avg_elapsed = elapsed / len(page_topics) if page_topics else 0.0
+        self.logger.info(
+            "Extracted page topics for %s pages with page-level parallelism=%s, total_time=%.2fs, avg_time_per_page=%.2fs",
+            len(page_topics),
+            page_parallel_limit,
+            elapsed,
+            avg_elapsed,
+        )
 
         self._page_topics_dict = page_topics
         await self._store_cached_page_topics(
@@ -2001,6 +2036,19 @@ class ProcessorMixin:
 
         # Log processing start
         self.logger.info(f"Starting to process {total_items} multimodal content items")
+        total_start_time = time.perf_counter()
+        stage_start_time = total_start_time
+
+        def _log_stage_duration(stage_name: str, start_time: float, **extra_data):
+            duration = time.perf_counter() - start_time
+            extra_parts = []
+            for key, value in extra_data.items():
+                extra_parts.append(f"{key}={value}")
+            extra_suffix = f" ({', '.join(extra_parts)})" if extra_parts else ""
+            self.logger.info(
+                f"[multimodal-timing] {stage_name} took {duration:.2f}s{extra_suffix}"
+            )
+            return time.perf_counter()
 
         # Stage 1: Concurrent generation of descriptions using correct processors for each type
         async def process_single_item_with_correct_processor(
@@ -2028,6 +2076,11 @@ class ProcessorMixin:
                         "index": index,
                         "type": content_type,
                     }
+                    page_topics = getattr(self, "_page_topics_dict", {}) or {}
+                    page_topic = page_topics.get(item_info["page_idx"])
+                    if page_topic:
+                        item_info["page_topic"] = page_topic
+                    item_start_time = time.perf_counter()
 
                     # Call the correct processor's description generation method
                     (
@@ -2062,6 +2115,7 @@ class ProcessorMixin:
                         "chunk_order_index": existing_chunks_count + index,
                         "processor": processor,  # Keep reference to the processor used
                         "file_path": file_path,  # Add file_path to the result
+                        "processing_duration_s": time.perf_counter() - item_start_time,
                     }
 
                 except Exception as e:
@@ -2105,6 +2159,34 @@ class ProcessorMixin:
             self.logger.warning("No valid multimodal descriptions generated")
             return
 
+        stage_start_time = _log_stage_duration(
+            "stage_1_generate_descriptions",
+            stage_start_time,
+            success_count=len(multimodal_data_list),
+            attempted_count=len(multimodal_items),
+        )
+
+        processing_durations = [
+            data.get("processing_duration_s", 0.0) for data in multimodal_data_list
+        ]
+        if processing_durations:
+            avg_duration = sum(processing_durations) / len(processing_durations)
+            slowest_item = max(
+                multimodal_data_list,
+                key=lambda data: data.get("processing_duration_s", 0.0),
+            )
+            self.logger.info(
+                "[multimodal-timing] Stage 1 item stats: avg=%.2fs, slowest=%.2fs "
+                "(type=%s, index=%s, page_idx=%s)"
+                % (
+                    avg_duration,
+                    slowest_item.get("processing_duration_s", 0.0),
+                    slowest_item.get("content_type", "unknown"),
+                    slowest_item.get("index", -1),
+                    slowest_item.get("item_info", {}).get("page_idx", 0),
+                )
+            )
+
         self.logger.info(
             f"Generated descriptions for {len(multimodal_data_list)}/{len(multimodal_items)} multimodal items using correct processors"
         )
@@ -2113,13 +2195,28 @@ class ProcessorMixin:
         lightrag_chunks = self._convert_to_lightrag_chunks_type_aware(
             multimodal_data_list, file_path, doc_id
         )
+        stage_start_time = _log_stage_duration(
+            "stage_2_convert_chunks",
+            stage_start_time,
+            chunk_count=len(lightrag_chunks),
+        )
 
         # Stage 3: Store chunks to LightRAG storage
         await self._store_chunks_to_lightrag_storage_type_aware(lightrag_chunks)
+        stage_start_time = _log_stage_duration(
+            "stage_3_store_chunks",
+            stage_start_time,
+            chunk_count=len(lightrag_chunks),
+        )
 
         # Stage 3.5: Store multimodal main entities to entities_vdb and full_entities
         await self._store_multimodal_main_entities(
             multimodal_data_list, lightrag_chunks, file_path, doc_id
+        )
+        stage_start_time = _log_stage_duration(
+            "stage_3_5_store_main_entities",
+            stage_start_time,
+            entity_count=len(multimodal_data_list),
         )
 
         # Track chunk IDs for doc_status update
@@ -2129,19 +2226,40 @@ class ProcessorMixin:
         chunk_results = await self._batch_extract_entities_lightrag_style_type_aware(
             lightrag_chunks
         )
+        stage_start_time = _log_stage_duration(
+            "stage_4_extract_entities",
+            stage_start_time,
+            chunk_result_count=len(chunk_results),
+        )
 
         # Stage 5: Add belongs_to relations (multimodal-specific)
         enhanced_chunk_results = await self._batch_add_belongs_to_relations_type_aware(
             chunk_results, multimodal_data_list
+        )
+        stage_start_time = _log_stage_duration(
+            "stage_5_add_belongs_to_relations",
+            stage_start_time,
+            chunk_result_count=len(enhanced_chunk_results),
         )
 
         # Stage 6: Use LightRAG's batch merge
         await self._batch_merge_lightrag_style_type_aware(
             enhanced_chunk_results, file_path, doc_id
         )
+        stage_start_time = _log_stage_duration(
+            "stage_6_merge_graph",
+            stage_start_time,
+            chunk_result_count=len(enhanced_chunk_results),
+        )
 
         # Stage 7: Update doc_status with integrated chunks_list
         await self._update_doc_status_with_chunks_type_aware(doc_id, chunk_ids)
+        _log_stage_duration(
+            "stage_7_update_doc_status",
+            stage_start_time,
+            chunk_count=len(chunk_ids),
+            total_duration_s=f"{time.perf_counter() - total_start_time:.2f}",
+        )
 
     def _convert_to_lightrag_chunks_type_aware(
         self, multimodal_data_list: List[Dict[str, Any]], file_path: str, doc_id: str

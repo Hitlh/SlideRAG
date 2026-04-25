@@ -138,6 +138,7 @@ class RAGAnything(QueryMixin, ProcessorMixin, BatchMixin):
             f"Equation: {self.config.enable_equation_processing}"
         )
         self.logger.info(f"  Max concurrent files: {self.config.max_concurrent_files}")
+        self.logger.info(f"  Page topic max async: {self.config.page_topic_max_async}")
 
     def close(self):
         """Cleanup resources when object is destroyed"""
@@ -527,6 +528,7 @@ class RAGAnything(QueryMixin, ProcessorMixin, BatchMixin):
             },
             "batch_processing": {
                 "max_concurrent_files": self.config.max_concurrent_files,
+                "page_topic_max_async": self.config.page_topic_max_async,
                 "supported_file_extensions": self.config.supported_file_extensions,
                 "recursive_folder_processing": self.config.recursive_folder_processing,
             },

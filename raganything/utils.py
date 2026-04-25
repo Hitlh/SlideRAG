@@ -30,6 +30,7 @@ def separate_content(
     page_texts: Dict[int, List[str]] = {}
 
     text_like_types = {"text", "expanded_text"}
+    passthrough_text_types = {"header", "footer", "page_number"}
 
     for item in content_list:
         content_type = item.get("type", "text")
@@ -44,6 +45,20 @@ def separate_content(
                     try:
                         page_key = int(page_idx)
                         page_texts.setdefault(page_key, []).append(text)
+                    except (ValueError, TypeError):
+                        pass
+        elif content_type in passthrough_text_types:
+            # Treat structural text blocks as regular text so they do not go
+            # through the multimodal pipeline and trigger expensive LLM/KG work.
+            text = item.get("text", "")
+            if isinstance(text, str) and text.strip():
+                clean_text = f"[{content_type}] {text.strip()}"
+                text_parts.append(clean_text)
+                page_idx = item.get("page_idx")
+                if page_idx is not None:
+                    try:
+                        page_key = int(page_idx)
+                        page_texts.setdefault(page_key, []).append(clean_text)
                     except (ValueError, TypeError):
                         pass
         elif content_type == "list" and item.get("sub_type") == "text":

@@ -874,6 +874,9 @@ class ImageModalProcessor(BaseModalProcessor):
             context = ""
             if item_info:
                 context = self._get_context_for_item(item_info)
+            page_topic = ""
+            if item_info:
+                page_topic = str(item_info.get("page_topic", "") or "").strip()
 
             # Build detailed visual analysis prompt with context
             if context:
@@ -881,6 +884,7 @@ class ImageModalProcessor(BaseModalProcessor):
                     "vision_prompt_with_context", PROMPTS["vision_prompt"]
                 ).format(
                     context=context,
+                    page_topic=page_topic if page_topic else "None",
                     entity_name=entity_name
                     if entity_name
                     else "unique descriptive name for this image",
@@ -890,6 +894,7 @@ class ImageModalProcessor(BaseModalProcessor):
                 )
             else:
                 vision_prompt = PROMPTS["vision_prompt"].format(
+                    page_topic=page_topic if page_topic else "None",
                     entity_name=entity_name
                     if entity_name
                     else "unique descriptive name for this image",

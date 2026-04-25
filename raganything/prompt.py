@@ -50,9 +50,17 @@ PROMPTS[
 }}
 
 Additional context:
+- Current Page Topic: {page_topic}
 - Image Path: {image_path}
 - Captions: {captions}
 - Footnotes: {footnotes}
+
+Important grounding rules:
+- First rely on visible text, labels, and structure inside the image itself.
+- Treat the current page topic as a grounding hint, not as permission to invent details.
+- If the image content conflicts with captions, footnotes, or inferred context, prioritize the visible image content.
+- If the image text is blurry or unreadable, explicitly say that some details are uncertain instead of guessing.
+- Do not infer specific companies, events, or timelines unless they are visible in the image or explicitly stated in the page topic/captions/footnotes.
 
 Focus on providing accurate, detailed visual analysis that would be useful for knowledge retrieval."""
 
@@ -78,7 +86,9 @@ PROMPTS[
     }}
 }}
 
-Context from surrounding content:
+Grounding information:
+- Current Page Topic: {page_topic}
+- Surrounding Context (supporting only, not authoritative when it conflicts with the image): 
 {context}
 
 Image details:
@@ -86,7 +96,15 @@ Image details:
 - Captions: {captions}
 - Footnotes: {footnotes}
 
-Focus on providing accurate, detailed visual analysis that incorporates the context and would be useful for knowledge retrieval."""
+Important grounding rules:
+- First identify any visible title, labels, numbers, legends, or other text inside the image and use them as the primary evidence.
+- Use the current page topic to disambiguate the image when it is consistent with the visible content.
+- Use surrounding context only when it supports or clarifies what is visible in the image; do not let it override contradictory image content.
+- If visible image content conflicts with surrounding context, captions, or footnotes, prioritize the visible image content, then the current page topic, then the supporting context.
+- If the image text is blurry or unreadable, explicitly state the uncertainty and keep the description conservative.
+- Do not infer specific companies, transactions, dates, or storylines unless they are visible in the image or explicitly stated in the page topic/captions/footnotes.
+
+Focus on providing accurate, detailed visual analysis that incorporates context without hallucinating unsupported details, and would be useful for knowledge retrieval."""
 
 # Image analysis prompt with text fallback
 PROMPTS["text_prompt"] = """Based on the following image information, provide analysis:

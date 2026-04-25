@@ -89,3 +89,7 @@ skills/
 #test
 pptbench_tests
 slidevqa_test
+
+#codex
+.codex
+AGENTS.md

@@ -85,6 +85,11 @@ class RAGAnythingConfig:
     )
     """Maximum number of files to process concurrently."""
 
+    page_topic_max_async: int = field(
+        default=get_env_value("PAGE_TOPIC_MAX_ASYNC", 2, int)
+    )
+    """Maximum number of pages to extract topics for concurrently."""
+
     supported_file_extensions: List[str] = field(
         default_factory=lambda: get_env_value(
             "SUPPORTED_FILE_EXTENSIONS",
