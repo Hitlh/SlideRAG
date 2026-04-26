@@ -34,6 +34,15 @@ def separate_content(
 
     for item in content_list:
         content_type = item.get("type", "text")
+        if content_type == "chart":
+            item = dict(item)
+            item["type"] = "image"
+            item.setdefault("original_type", "chart")
+            if "chart_caption" in item and "image_caption" not in item:
+                item["image_caption"] = item.get("chart_caption", [])
+            if "chart_footnote" in item and "image_footnote" not in item:
+                item["image_footnote"] = item.get("chart_footnote", [])
+            content_type = "image"
 
         if content_type in text_like_types:
             # Text content

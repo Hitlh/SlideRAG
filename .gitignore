@@ -88,7 +88,13 @@ skills/
 
 #test
 pptbench_tests
-slidevqa_test
+# Keep SlideVQA scripts trackable, but ignore local datasets/caches/runs.
+slidevqa_test/cache/
+slidevqa_test/dest/
+slidevqa_test/output/
+slidevqa_test/runs/
+slidevqa_test/tmp_parse/
+slidevqa_test/*.parquet
 
 #codex
 .codex

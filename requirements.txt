@@ -2,7 +2,7 @@ huggingface_hub
 # LightRAG packages
 lightrag-hku
 # MinerU 2.0 packages (replaces magic-pdf)
-mineru[core]
+mineru[core]==3.0.0
 # Progress bars for batch processing
 tqdm
 httpx
