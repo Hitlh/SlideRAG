@@ -69,6 +69,10 @@ def deck_cache_dir(deck_name: str) -> Path:
     return CACHE_ROOT / sanitize_component(deck_name)
 
 
+def deck_cache_dir_for_root(cache_root: Path, deck_name: str) -> Path:
+    return cache_root / sanitize_component(deck_name)
+
+
 def format_duration(seconds: float) -> str:
     if seconds < 60:
         return f"{seconds:.2f}s"
@@ -87,7 +91,7 @@ def record_timing(timings: dict[str, float], name: str, started_at: float) -> No
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run agent-based evaluation on the first SlideVQA sample."
+        description="Run agent-based evaluation on one SlideVQA deck."
     )
     parser.add_argument(
         "--parquet",
@@ -106,6 +110,30 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="",
         help="Override the sample question. Defaults to the question in the first row.",
+    )
+    parser.add_argument(
+        "--deck-name",
+        type=str,
+        default="",
+        help="Evaluate this deck_name. Defaults to row-index selection.",
+    )
+    parser.add_argument(
+        "--row-index",
+        type=int,
+        default=1,
+        help="Row index used when --deck-name is omitted.",
+    )
+    parser.add_argument(
+        "--cache-root",
+        type=Path,
+        default=CACHE_ROOT,
+        help="Deck cache root for extracted pages, parsed content, and RAG storage.",
+    )
+    parser.add_argument(
+        "--result-json",
+        type=Path,
+        default=None,
+        help="Optional fixed result JSON path for supervisor/worker runs.",
     )
     parser.add_argument(
         "--use-llm-for-topics",
@@ -199,9 +227,25 @@ def find_deck_group(grouped_payload: dict[str, Any], deck_name: str) -> dict[str
     raise ValueError(f"Cannot find QA group for deck_name: {deck_name}")
 
 
+def select_eval_row(df: pd.DataFrame, deck_name: str, row_index: int) -> pd.Series:
+    if deck_name:
+        if "deck_name" not in df.columns:
+            raise ValueError("Cannot select by --deck-name because parquet has no deck_name column.")
+        matches = df[df["deck_name"].astype(str).str.strip() == deck_name]
+        if matches.empty:
+            raise ValueError(f"Cannot find deck_name in parquet: {deck_name}")
+        return matches.iloc[0]
+
+    if row_index < 0 or row_index >= len(df):
+        raise IndexError(f"--row-index {row_index} is out of range for {len(df)} rows.")
+    return df.iloc[row_index]
+
+
 async def answer_deck_questions(
-    rag: RAGAnything,
+    agent_loop: AgentLoop,
     deck_qa_items: list[dict[str, Any]],
+    *,
+    deck_slug: str,
 ) -> list[dict[str, Any]]:
     qa_results: list[dict[str, Any]] = []
 
@@ -210,18 +254,37 @@ async def answer_deck_questions(
         if not question:
             continue
 
-        answer = await rag.aquery(question, mode="hybrid")
+        qa_id = qa_item.get("qa_id")
+        eval_prompt = (
+            "Answer this SlideVQA question using the target slide deck.\n"
+            "Requirements:\n"
+            "- Use the retrieve tool before answering.\n"
+            "- Put the key answer first, preferably in one short sentence.\n"
+            "- Do not restate the question.\n"
+            "- Do not add broad background unless it is needed to disambiguate the answer.\n"
+            "- If helpful, add at most one brief supporting sentence.\n\n"
+            f"Question: {question}"
+        )
+        session_key = f"slidevqa_eval:{deck_slug}"
+        agent_result = await agent_loop.process_message(
+            user_message=eval_prompt,
+            channel="slidevqa_eval",
+            chat_id=deck_slug,
+            session_key=session_key,
+        )
 
         qa_results.append(
             {
                 "row_index": qa_item.get("row_index"),
-                "qa_id": qa_item.get("qa_id"),
+                "qa_id": qa_id,
                 "question": question,
                 "ground_truth_answer": qa_item.get("answer"),
                 "metadata": qa_item.get("metadata"),
                 "query_result": {
-                    "answer": answer,
-                    "mode": "hybrid",
+                    "answer": agent_result.final_answer,
+                    "mode": "agent_hybrid",
+                    "tools_used": agent_result.tools_used,
+                    "iterations": agent_result.iterations,
                 },
             }
         )
@@ -259,27 +322,24 @@ def coerce_judge_payload(
     finish_reason: str,
     raw_content: str,
 ) -> dict[str, Any]:
-    confidence = payload.get("confidence", 0.0)
+    score = payload.get("score", payload.get("score_0_to_100", 0))
     try:
-        confidence_value = float(confidence)
+        score_value = float(score)
     except (TypeError, ValueError):
-        confidence_value = 0.0
+        score_value = 0.0
 
-    confidence_value = max(0.0, min(1.0, confidence_value))
-    is_correct = payload.get("is_correct", False)
-    if isinstance(is_correct, str):
-        is_correct = is_correct.strip().lower() in {"1", "true", "yes", "correct"}
+    score_value = max(0.0, min(100.0, score_value))
 
     reason = str(payload.get("reason", "")).strip()
     if not reason:
         reason = "No reason provided by judge model."
 
     result = {
-        "is_correct": bool(is_correct),
-        "confidence": confidence_value,
+        "score": score_value,
         "reason": reason,
         "judge_model": judge_model,
         "judge_method": "llm",
+        "score_scale": "0-100",
         "finish_reason": finish_reason,
     }
     if raw_content and payload.get("reason") is None:
@@ -294,27 +354,34 @@ def build_answer_judge_messages(
     predicted_answer: Any,
 ) -> list[dict[str, str]]:
     system_prompt = (
-        "You are a strict but fair evaluator for document QA results. "
-        "Judge whether the predicted answer correctly answers the question "
-        "when compared with the ground truth answer. Do not use outside knowledge. "
+        "You are a fair evaluator for document QA results. "
+        "Score how well the predicted answer answers the question when compared "
+        "with the ground truth answer. Do not use outside knowledge. "
         "Return only valid JSON."
     )
-    user_prompt = f"""Evaluate the predicted answer against the ground truth.
+    user_prompt = f"""Score the predicted answer against the ground truth.
 
 Return only this JSON object:
 {{
-  "is_correct": true or false,
-  "confidence": a number from 0.0 to 1.0,
+  "score": an integer or decimal from 0 to 100,
   "reason": "brief explanation"
 }}
 
+Scoring guide:
+- 100: Fully answers the question; semantically equivalent to the ground truth.
+- 80-99: Correct answer is clearly present, with harmless extra context, slide/document background, references, or minor wording differences.
+- 50-79: Partially correct; captures some required information but misses important parts or is somewhat vague.
+- 1-49: Mostly wrong but has a small relevant fragment.
+- 0: Wrong, unrelated, contradictory, or refuses to answer when the ground truth is concrete.
+
 Rules:
-- Semantic equivalence counts as correct; exact wording is not required.
+- Semantic equivalence should receive a high score; exact wording is not required.
 - Units, abbreviations, punctuation, and formatting may differ if the meaning is equivalent.
+- The predicted answer is generated by an agent over a whole slide deck, so it may include background, explanations, section details, references, or supporting context. Do not penalize these when the key answer is correct.
+- If the prediction includes references, markdown, repeated source names, or extra explanation, judge the answer content rather than penalizing format.
+- If the prediction contains the ground truth plus non-contradictory extra details, give a high score, usually 90-100.
+- If the prediction contains the ground truth but also gives contradictory information, reduce the score according to severity.
 - If the question asks for a percentage, an answer like "3.6" may match "3.6%" when context makes the unit clear.
-- If the prediction restates the question, includes references, or adds explanation, judge only whether its answer content matches.
-- If the prediction contains the ground truth but also gives a contradictory final answer, mark it incorrect.
-- If the prediction refuses to answer or says information is unavailable while the ground truth has a concrete answer, mark it incorrect.
 
 Question:
 {question}
@@ -357,11 +424,11 @@ async def judge_single_qa_result(
 
     if response.finish_reason == "error":
         return {
-            "is_correct": False,
-            "confidence": 0.0,
+            "score": 0.0,
             "reason": response.content or "Judge model returned an error.",
             "judge_model": judge_model,
             "judge_method": "error",
+            "score_scale": "0-100",
             "finish_reason": response.finish_reason,
             "needs_review": True,
         }
@@ -370,11 +437,11 @@ async def judge_single_qa_result(
     parsed = extract_json_object(raw_content)
     if parsed is None:
         return {
-            "is_correct": False,
-            "confidence": 0.0,
+            "score": 0.0,
             "reason": "Judge model did not return valid JSON.",
             "judge_model": judge_model,
             "judge_method": "parse_error",
+            "score_scale": "0-100",
             "finish_reason": response.finish_reason,
             "needs_review": True,
             "raw_judge_response": raw_content,
@@ -410,8 +477,8 @@ async def judge_qa_results(
         default_model=judge_model,
     )
 
-    correct = 0
     needs_review = 0
+    total_score = 0.0
     for index, qa_result in enumerate(qa_results, start=1):
         judgement = await judge_single_qa_result(
             provider,
@@ -420,24 +487,25 @@ async def judge_qa_results(
             max_tokens=judge_max_tokens,
         )
         qa_result["llm_judgement"] = judgement
-        if judgement.get("is_correct"):
-            correct += 1
+        try:
+            total_score += float(judgement.get("score", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            pass
         if judgement.get("needs_review"):
             needs_review += 1
         print(
             f"[JUDGE] {index}/{len(qa_results)} "
             f"qa_id={qa_result.get('qa_id')} "
-            f"is_correct={judgement.get('is_correct')} "
-            f"confidence={judgement.get('confidence')}"
+            f"score={judgement.get('score')}"
         )
 
     total = len(qa_results)
     return {
         "total": total,
-        "correct": correct,
-        "incorrect": total - correct,
         "needs_review": needs_review,
-        "accuracy": correct / total if total else 0.0,
+        "total_score": total_score,
+        "average_score": total_score / total if total else 0.0,
+        "score_scale": "0-100",
         "judge_model": judge_model,
         "judge_method": "llm",
     }
@@ -579,6 +647,30 @@ class EvaluationRAGService:
 
         raise RuntimeError(f"Unsupported AGENT_PROVIDER: {agent_provider}")
 
+    def get_agent_loop(self, rag: RAGAnything, workspace: Path) -> AgentLoop:
+        workspace_key = str(workspace.resolve())
+        if workspace_key in self.agent_loop_pool:
+            return self.agent_loop_pool[workspace_key]
+
+        workspace.mkdir(parents=True, exist_ok=True)
+        agent_loop = AgentLoop(
+            provider=self._build_agent_provider(),
+            workspace=workspace,
+            rag=rag,
+            model=get_env_str("AGENT_MODEL", "gpt-4o"),
+            max_iterations=get_env_int("AGENT_MAX_ITERATIONS", 8),
+            max_tool_calls=get_env_int("AGENT_MAX_TOOL_CALLS", 8),
+            max_tokens=get_env_int("AGENT_MAX_TOKENS", 2048),
+            retrieve_config={
+                "mode": "hybrid",
+                "top_k": get_env_int("RETRIEVE_TOP_K", 20),
+                "chunk_top_k": get_env_int("RETRIEVE_CHUNK_TOP_K", 20),
+            },
+        )
+        self.agent_loop_pool[workspace_key] = agent_loop
+        return agent_loop
+
+
 async def parse_pages_into_combined_content(
     engine: RAGAnything,
     saved_pages: list[dict[str, Any]],
@@ -635,12 +727,12 @@ async def main() -> None:
     if df.empty:
         raise ValueError("The parquet file is empty.")
 
-    row = df.iloc[1]
+    row = select_eval_row(df, args.deck_name.strip(), args.row_index)
     deck_name = str(row.get("deck_name", "sample")).strip() or "sample"
     qa_id = int(row.get("qa_id", 0))
 
     deck_slug = sanitize_component(deck_name)
-    deck_dir = deck_cache_dir(deck_name)
+    deck_dir = deck_cache_dir_for_root(args.cache_root, deck_name)
     grouped_payload = load_json(args.qa_groups)
     if not isinstance(grouped_payload, dict):
         raise ValueError(f"Invalid grouped QA payload: {args.qa_groups}")
@@ -753,8 +845,9 @@ async def main() -> None:
 
     stage_started_at = time.perf_counter()
     qa_results = await answer_deck_questions(
-        rag=engine,
+        agent_loop=service.get_agent_loop(engine, run_root / "agent_loop_workspace"),
         deck_qa_items=deck_qa_items,
+        deck_slug=deck_slug,
     )
     record_timing(timings, "answer_deck_questions", stage_started_at)
 
@@ -809,6 +902,8 @@ async def main() -> None:
         final_result["llm_judgement_summary"] = llm_judgement_summary
 
     save_json(results_root / "result.json", final_result)
+    if args.result_json is not None:
+        save_json(args.result_json, final_result)
     print(json.dumps(final_result, ensure_ascii=False, indent=2))
     print("[TIMING] program_finished:", format_duration(time.perf_counter() - total_started_at))
 

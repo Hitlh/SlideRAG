@@ -94,6 +94,7 @@ slidevqa_test/dest/
 slidevqa_test/output/
 slidevqa_test/runs/
 slidevqa_test/tmp_parse/
+slidevqa_test/runs_dataset/
 slidevqa_test/*.parquet
 
 #codex
