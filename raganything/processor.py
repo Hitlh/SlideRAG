@@ -951,11 +951,20 @@ class ProcessorMixin:
                     continue
                 '''
 
-                # First pass: collect page text context (text + list[text])
+                # First pass: collect page text context (text + structural text + list[text])
                 text_parts: List[str] = []
+                structural_text_types = {"header", "footer"}
                 for i in items:
                     if i.get("type") == "text" and isinstance(i.get("text"), str):
-                        text_parts.append(i["text"].strip())
+                        text = i["text"].strip()
+                        if text:
+                            text_parts.append(text)
+                    elif i.get("type") in structural_text_types and isinstance(
+                        i.get("text"), str
+                    ):
+                        text = i["text"].strip()
+                        if text:
+                            text_parts.append(text)
                     elif i.get("type") == "list" and i.get("sub_type") == "text":
                         li = i.get("list_items", [])
                         if isinstance(li, list) and li:
@@ -963,7 +972,7 @@ class ProcessorMixin:
                             joined = "\n".join(
                                 [s.strip() for s in li if isinstance(s, str)]
                             )
-                            if joined:
+                            if joined.strip():
                                 text_parts.append(joined)
 
                 page_context = "\n".join([p for p in text_parts if p])
@@ -1007,14 +1016,22 @@ class ProcessorMixin:
                     fallback_topic = "Page_{0}".format(page_idx)
                 else:
                     fallback_topic = "第{0}页".format(page_idx)
-                if text_parts:
-                    first_line = text_parts[0].splitlines()[0].strip()
+                for text_part in text_parts:
+                    first_line = next(
+                        (
+                            line.strip()
+                            for line in text_part.splitlines()
+                            if line.strip()
+                        ),
+                        "",
+                    )
                     if first_line:
                         fallback_topic = (
                             first_line
                             if len(first_line) <= 80
                             else first_line[:77] + "..."
                         )
+                        break
 
                 if not page_text.strip():
                     return page_idx, fallback_topic
