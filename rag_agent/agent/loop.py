@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
-from datetime import datetime
+import mimetypes
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +31,8 @@ class AgentLoopResult:
 
 class AgentLoop:
     """Minimal loop that lets the LLM decide when to call RAG tools."""
+
+    _VISUAL_EVIDENCE_PREFIX = "[Retrieved Visual Evidence]"
 
     def __init__(
         self,
@@ -61,6 +65,11 @@ class AgentLoop:
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.retrieve_config = dict(retrieve_config or {})
+        self.attach_retrieve_images = bool(self.retrieve_config.get("attach_images", True))
+        self.max_retrieve_images = int(self.retrieve_config.get("max_images", 10) or 10)
+        self.max_retrieve_image_bytes = int(
+            self.retrieve_config.get("max_image_bytes", 5 * 1024 * 1024) or 5 * 1024 * 1024
+        )
 
         self.context = context or ContextBuilder()
         self.tools = tools or ToolRegistry()
@@ -174,6 +183,7 @@ class AgentLoop:
             if response.has_tool_calls:
                 tool_call_dicts = [tc.to_openai_tool_call() for tc in response.tool_calls]
                 messages = self.context.add_assistant_message(messages, response.content, tool_call_dicts)
+                visual_items: list[dict[str, Any]] = []
 
                 for tool_call in response.tool_calls:
                     tool_calls_count += 1
@@ -197,6 +207,17 @@ class AgentLoop:
                         tool_name=tool_call.name,
                         result=tool_result,
                     )
+
+                    if self.attach_retrieve_images:
+                        visual_items.extend(self._extract_retrieve_image_items(tool_call.name, tool_result))
+
+                visual_message = self._build_visual_evidence_message(
+                    visual_items,
+                    max_images=self.max_retrieve_images,
+                    max_image_bytes=self.max_retrieve_image_bytes,
+                )
+                if visual_message:
+                    messages.append(visual_message)
                 continue
 
             final_answer = response.content or ""
@@ -216,6 +237,150 @@ class AgentLoop:
             iterations=self.max_iterations,
             messages=messages,
         )
+
+    @staticmethod
+    def _extract_retrieve_image_items(tool_name: str, tool_result: str) -> list[dict[str, Any]]:
+        """Extract image metadata from retrieve JSON while preserving chunk bindings."""
+        if tool_name != "retrieve":
+            return []
+
+        try:
+            payload = json.loads(tool_result)
+        except json.JSONDecodeError:
+            return []
+
+        evidence = payload.get("evidence") if isinstance(payload, dict) else None
+        image_chunks = evidence.get("image_chunks") if isinstance(evidence, dict) else None
+        if not isinstance(image_chunks, list):
+            return []
+
+        items: list[dict[str, Any]] = []
+        for idx, item in enumerate(image_chunks):
+            if not isinstance(item, dict):
+                continue
+
+            image_path = item.get("image_path")
+            if not isinstance(image_path, str) or not image_path.strip():
+                continue
+
+            items.append(
+                {
+                    "visual_id": item.get("visual_id") or f"IMG-{idx + 1}",
+                    "stable_visual_id": item.get("stable_visual_id"),
+                    "image_path": image_path.strip(),
+                    "chunk_id": item.get("chunk_id"),
+                    "reference_id": item.get("reference_id"),
+                    "image_chunk_index": idx,
+                }
+            )
+
+        return items
+
+    @classmethod
+    def _build_visual_evidence_message(
+        cls,
+        image_items: list[dict[str, Any]],
+        max_images: int,
+        max_image_bytes: int,
+    ) -> dict[str, Any] | None:
+        """Build a synthetic multimodal message that binds each image to its image_chunk."""
+        if max_images <= 0 or not image_items:
+            return None
+
+        content: list[dict[str, Any]] = [
+            {
+                "type": "text",
+                "text": (
+                    f"{cls._VISUAL_EVIDENCE_PREFIX}\n"
+                    "The retrieve tool returned the following images as visual evidence. "
+                    "Each image is preceded by metadata. Match each image to "
+                    "`retrieve.evidence.image_chunks[*]` by `visual_id`, `chunk_id`, "
+                    "`reference_id`, or `image_path`. Do not mix facts across different visual_ids."
+                ),
+            }
+        ]
+
+        seen_paths: set[str] = set()
+        attached_count = 0
+        skipped_visual_ids: list[str] = []
+
+        for item_index, item in enumerate(image_items):
+            image_path = item.get("image_path")
+            if not isinstance(image_path, str) or not image_path:
+                continue
+
+            visual_id = str(item.get("visual_id") or f"IMG-{attached_count + 1}")
+            if image_path in seen_paths:
+                skipped_visual_ids.append(visual_id)
+                continue
+            seen_paths.add(image_path)
+
+            data_url = cls._image_path_to_data_url(image_path, max_bytes=max_image_bytes)
+            if not data_url:
+                skipped_visual_ids.append(visual_id)
+                continue
+
+            content.append(
+                {
+                    "type": "text",
+                    "text": (
+                        f"visual_id: {visual_id}\n"
+                        f"stable_visual_id: {item.get('stable_visual_id')}\n"
+                        f"chunk_id: {item.get('chunk_id')}\n"
+                        f"reference_id: {item.get('reference_id')}\n"
+                        f"image_path: {image_path}\n"
+                        f"corresponds_to: retrieve.evidence.image_chunks[{item.get('image_chunk_index')}]"
+                    ),
+                }
+            )
+            content.append({"type": "image_url", "image_url": {"url": data_url}})
+
+            attached_count += 1
+            if attached_count >= max_images:
+                remaining = image_items[item_index + 1 :]
+                skipped_visual_ids.extend(
+                    str(remaining_item.get("visual_id") or "")
+                    for remaining_item in remaining
+                    if isinstance(remaining_item, dict) and remaining_item.get("visual_id")
+                )
+                break
+
+        if attached_count == 0:
+            return None
+
+        if skipped_visual_ids:
+            content.append(
+                {
+                    "type": "text",
+                    "text": (
+                        "Not all retrieved images were attached. These visual_ids have only text "
+                        f"evidence in the retrieve JSON or were skipped: {', '.join(skipped_visual_ids)}"
+                    ),
+                }
+            )
+
+        return {"role": "user", "content": content}
+
+    @staticmethod
+    def _image_path_to_data_url(image_path: str, max_bytes: int) -> str | None:
+        path = Path(image_path).expanduser().resolve()
+        if not path.exists() or not path.is_file():
+            return None
+
+        if max_bytes > 0 and path.stat().st_size > max_bytes:
+            return None
+
+        mime_type, _ = mimetypes.guess_type(str(path))
+        allowed_mime_types = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+        if mime_type not in allowed_mime_types:
+            return None
+
+        try:
+            encoded = base64.b64encode(path.read_bytes()).decode("utf-8")
+        except OSError:
+            return None
+
+        return f"data:{mime_type};base64,{encoded}"
 
     @staticmethod
     def _build_session_key(
@@ -265,6 +430,9 @@ class AgentLoop:
             if role == "assistant" and not content and not entry.get("tool_calls"):
                 continue
 
+            if role == "user" and AgentLoop._is_visual_evidence_message(content):
+                continue
+
             if role == "user" and isinstance(content, str) and content.startswith(ContextBuilder._RUNTIME_CONTEXT_TAG):
                 parts = content.split("\n\n", 1)
                 if len(parts) > 1 and parts[1].strip():
@@ -276,3 +444,13 @@ class AgentLoop:
             session.messages.append(entry)
 
         session.updated_at = datetime.now()
+
+    @classmethod
+    def _is_visual_evidence_message(cls, content: Any) -> bool:
+        if not isinstance(content, list) or not content:
+            return False
+        first = content[0]
+        if not isinstance(first, dict):
+            return False
+        text = first.get("text")
+        return isinstance(text, str) and text.startswith(cls._VISUAL_EVIDENCE_PREFIX)

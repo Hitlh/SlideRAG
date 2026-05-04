@@ -147,6 +147,18 @@ def parse_args() -> argparse.Namespace:
         default=SCRIPT_DIR / "cache" / "qa_groups" / "by_deck_name.json",
         help="Preprocessed grouped QA payload produced by preprocess_slidevqa_groups.py.",
     )
+    parser.add_argument(
+        "--answer-mode",
+        choices=("agent", "aquery"),
+        default=get_env_str("ANSWER_MODE", "agent").strip().lower() or "agent",
+        help="Use the tool-calling agent loop or direct rag.aquery for QA generation.",
+    )
+    parser.add_argument(
+        "--aquery-mode",
+        choices=("local", "global", "hybrid", "naive", "mix", "bypass"),
+        default=get_env_str("AQUERY_MODE", "hybrid").strip().lower() or "hybrid",
+        help="LightRAG retrieval mode used when --answer-mode=aquery.",
+    )
     return parser.parse_args()
 
 
@@ -241,7 +253,7 @@ def select_eval_row(df: pd.DataFrame, deck_name: str, row_index: int) -> pd.Seri
     return df.iloc[row_index]
 
 
-async def answer_deck_questions(
+async def answer_deck_questions_with_agent(
     agent_loop: AgentLoop,
     deck_qa_items: list[dict[str, Any]],
     *,
@@ -285,6 +297,71 @@ async def answer_deck_questions(
                     "mode": "agent_hybrid",
                     "tools_used": agent_result.tools_used,
                     "iterations": agent_result.iterations,
+                },
+            }
+        )
+
+    return qa_results
+
+
+async def answer_deck_questions_with_aquery(
+    rag: RAGAnything,
+    deck_qa_items: list[dict[str, Any]],
+    *,
+    query_mode: str,
+) -> list[dict[str, Any]]:
+    qa_results: list[dict[str, Any]] = []
+    top_k = get_env_int("RETRIEVE_TOP_K", 20)
+    chunk_top_k = get_env_int("RETRIEVE_CHUNK_TOP_K", 20)
+    max_entity_tokens = get_env_int("AQUERY_MAX_ENTITY_TOKENS", 6000)
+    max_relation_tokens = get_env_int("AQUERY_MAX_RELATION_TOKENS", 8000)
+    max_total_tokens = get_env_int("AQUERY_MAX_TOTAL_TOKENS", 30000)
+    include_references = get_env_bool("AQUERY_INCLUDE_REFERENCES", False)
+    vlm_enhanced = get_env_bool("AQUERY_VLM_ENHANCED", True)
+    response_type = get_env_str("AQUERY_RESPONSE_TYPE", "Single concise answer")
+    system_prompt = (
+        "Answer SlideVQA questions using only the retrieved target slide deck content. "
+        "Put the key answer first, preferably in one short sentence. Do not restate "
+        "the question. Do not add broad background unless needed to disambiguate. "
+        "If helpful, add at most one brief supporting sentence."
+    )
+
+    for qa_item in deck_qa_items:
+        question = str(qa_item.get("question", "")).strip()
+        if not question:
+            continue
+
+        answer_started_at = time.perf_counter()
+        answer = await rag.aquery(
+            question,
+            mode=query_mode,
+            system_prompt=system_prompt,
+            top_k=top_k,
+            chunk_top_k=chunk_top_k,
+            max_entity_tokens=max_entity_tokens,
+            max_relation_tokens=max_relation_tokens,
+            max_total_tokens=max_total_tokens,
+            include_references=include_references,
+            response_type=response_type,
+            vlm_enhanced=vlm_enhanced,
+        )
+
+        qa_results.append(
+            {
+                "row_index": qa_item.get("row_index"),
+                "qa_id": qa_item.get("qa_id"),
+                "question": question,
+                "ground_truth_answer": qa_item.get("answer"),
+                "metadata": qa_item.get("metadata"),
+                "query_result": {
+                    "answer": answer,
+                    "mode": "rag_aquery",
+                    "query_mode": query_mode,
+                    "top_k": top_k,
+                    "chunk_top_k": chunk_top_k,
+                    "vlm_enhanced": vlm_enhanced,
+                    "include_references": include_references,
+                    "elapsed_seconds": time.perf_counter() - answer_started_at,
                 },
             }
         )
@@ -665,6 +742,7 @@ class EvaluationRAGService:
                 "mode": "hybrid",
                 "top_k": get_env_int("RETRIEVE_TOP_K", 20),
                 "chunk_top_k": get_env_int("RETRIEVE_CHUNK_TOP_K", 20),
+                "max_images": 10,
             },
         )
         self.agent_loop_pool[workspace_key] = agent_loop
@@ -743,7 +821,7 @@ async def main() -> None:
     record_timing(timings, "setup_and_load_inputs", stage_started_at)
 
     stage_started_at = time.perf_counter()
-    run_name = f"{deck_slug}_qa_{qa_id:04d}_{time.strftime('%Y%m%d_%H%M%S')}"
+    run_name = f"{deck_slug}_{args.answer_mode}_qa_{qa_id:04d}_{time.strftime('%Y%m%d_%H%M%S')}"
     run_root = args.output_root / run_name
     source_image_dir = deck_dir / "source_pages"
     page_parse_root = deck_dir / "page_parse"
@@ -844,11 +922,18 @@ async def main() -> None:
     record_timing(timings, "build_or_update_rag_index", stage_started_at)
 
     stage_started_at = time.perf_counter()
-    qa_results = await answer_deck_questions(
-        agent_loop=service.get_agent_loop(engine, run_root / "agent_loop_workspace"),
-        deck_qa_items=deck_qa_items,
-        deck_slug=deck_slug,
-    )
+    if args.answer_mode == "agent":
+        qa_results = await answer_deck_questions_with_agent(
+            agent_loop=service.get_agent_loop(engine, run_root / "agent_loop_workspace"),
+            deck_qa_items=deck_qa_items,
+            deck_slug=deck_slug,
+        )
+    else:
+        qa_results = await answer_deck_questions_with_aquery(
+            rag=engine,
+            deck_qa_items=deck_qa_items,
+            query_mode=args.aquery_mode,
+        )
     record_timing(timings, "answer_deck_questions", stage_started_at)
 
     llm_judgement_summary = None
@@ -890,6 +975,8 @@ async def main() -> None:
         "combined_cache_key": combined_cache_key,
         "pages": page_reports,
         "combined_blocks": len(combined_content_list),
+        "answer_mode": args.answer_mode,
+        "aquery_mode": args.aquery_mode if args.answer_mode == "aquery" else None,
         "qa_group": {
             "deck_name": deck_group.get("deck_name", deck_name),
             "qa_count": deck_group.get("qa_count", len(deck_qa_items)),

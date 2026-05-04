@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from typing import Any
 
@@ -123,7 +124,11 @@ class RetrieveTool(Tool):
             if not RetrieveTool._is_image_analysis_chunk(content):
                 continue
 
+            image_path = RetrieveTool._extract_image_path(content)
+            visual_index = len(image_chunks) + 1
             image_item = {
+                "visual_id": f"IMG-{visual_index}",
+                "stable_visual_id": RetrieveTool._build_stable_visual_id(chunk, image_path, visual_index),
                 "chunk_type": "image_analysis",
                 "is_image": True,
                 "content": content,
@@ -133,7 +138,6 @@ class RetrieveTool(Tool):
             if "reference_id" in chunk:
                 image_item["reference_id"] = chunk.get("reference_id")
 
-            image_path = RetrieveTool._extract_image_path(content)
             if image_path:
                 image_item["image_path"] = image_path
 
@@ -214,3 +218,9 @@ class RetrieveTool(Tool):
                 value = stripped.split(":", 1)[1].strip() if ":" in stripped else ""
                 return value or None
         return None
+
+    @staticmethod
+    def _build_stable_visual_id(chunk: dict[str, Any], image_path: str | None, index: int) -> str:
+        basis = str(chunk.get("chunk_id") or image_path or index)
+        digest = hashlib.md5(basis.encode("utf-8")).hexdigest()[:8]
+        return f"IMG-{digest}"

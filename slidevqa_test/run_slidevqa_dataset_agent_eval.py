@@ -105,6 +105,18 @@ def parse_args() -> argparse.Namespace:
         help="Disable LLM answer judging in worker processes.",
     )
     parser.add_argument(
+        "--answer-mode",
+        choices=("agent", "aquery"),
+        default=os.getenv("ANSWER_MODE", "agent").strip().lower() or "agent",
+        help="Worker QA generation mode: tool-calling agent loop or direct rag.aquery.",
+    )
+    parser.add_argument(
+        "--aquery-mode",
+        choices=("local", "global", "hybrid", "naive", "mix", "bypass"),
+        default=os.getenv("AQUERY_MODE", "hybrid").strip().lower() or "hybrid",
+        help="LightRAG query mode passed to workers when --answer-mode=aquery.",
+    )
+    parser.add_argument(
         "--stop-on-error",
         action="store_true",
         help="Stop the dataset run after the first failed deck.",
@@ -161,11 +173,26 @@ def deck_result_path(run_dir: Path, deck_name: str) -> Path:
     return run_dir / "decks" / sanitize_component(deck_name) / "result.json"
 
 
-def result_is_complete(result_path: Path, deck_name: str, expected_qa_count: int, judge_enabled: bool) -> bool:
+def result_is_complete(
+    result_path: Path,
+    deck_name: str,
+    expected_qa_count: int,
+    judge_enabled: bool,
+    *,
+    answer_mode: str,
+    aquery_mode: str,
+) -> bool:
     payload = load_json(result_path)
     if not isinstance(payload, dict):
         return False
     if str(payload.get("deck_name", "")).strip() != deck_name:
+        return False
+    if str(payload.get("answer_mode", "agent")).strip() != answer_mode:
+        return False
+    if (
+        answer_mode == "aquery"
+        and str(payload.get("aquery_mode", "")).strip() != aquery_mode
+    ):
         return False
     qa_results = payload.get("qa_results")
     if not isinstance(qa_results, list) or len(qa_results) != expected_qa_count:
@@ -182,6 +209,8 @@ def build_initial_manifest(args: argparse.Namespace, decks: list[dict[str, Any]]
         "qa_groups": str(args.qa_groups),
         "output_root": str(args.output_root),
         "cache_root": str(args.cache_root),
+        "answer_mode": args.answer_mode,
+        "aquery_mode": args.aquery_mode if args.answer_mode == "aquery" else None,
         "created_at": int(time.time()),
         "updated_at": int(time.time()),
         "deck_count": len(decks),
@@ -334,12 +363,18 @@ def run_deck_worker(
         str(args.cache_root),
         "--result-json",
         str(result_path),
+        "--answer-mode",
+        args.answer_mode,
+        "--aquery-mode",
+        args.aquery_mode,
     ]
 
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
     if args.no_judge:
         env["EVAL_JUDGE_ENABLED"] = "false"
+    env["ANSWER_MODE"] = args.answer_mode
+    env["AQUERY_MODE"] = args.aquery_mode
 
     with stdout_path.open("w", encoding="utf-8") as stdout_f, stderr_path.open(
         "w", encoding="utf-8"
@@ -407,10 +442,14 @@ def main() -> int:
     run_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = run_dir / "manifest.json"
     manifest = load_or_create_manifest(args=args, decks=get_decks(grouped_payload), run_dir=run_dir)
+    manifest["answer_mode"] = args.answer_mode
+    manifest["aquery_mode"] = args.aquery_mode if args.answer_mode == "aquery" else None
+    save_json(manifest_path, manifest)
     judge_enabled = (not args.no_judge) and get_env_bool("EVAL_JUDGE_ENABLED", True)
 
     print(
         f"[START] run_dir={run_dir} selected_decks={len(decks)} "
+        f"answer_mode={args.answer_mode} aquery_mode={args.aquery_mode} "
         f"resume_manifest={manifest_path}"
     )
 
@@ -429,6 +468,8 @@ def main() -> int:
                 deck_name=deck_name,
                 expected_qa_count=expected_qa_count,
                 judge_enabled=judge_enabled,
+                answer_mode=args.answer_mode,
+                aquery_mode=args.aquery_mode,
             ):
                 entry["status"] = "success"
                 entry["result_path"] = str(result_path)
@@ -467,6 +508,8 @@ def main() -> int:
                 deck_name=deck_name,
                 expected_qa_count=expected_qa_count,
                 judge_enabled=judge_enabled,
+                answer_mode=args.answer_mode,
+                aquery_mode=args.aquery_mode,
             ):
                 entry["status"] = "success"
                 print(f"[DONE] {deck_name} in {format_duration(elapsed)}")
