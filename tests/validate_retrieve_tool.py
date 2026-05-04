@@ -41,11 +41,21 @@ class _FakeLightRAG:
                         "file_path": "demo.pdf",
                         "chunk_id": "chunk-1",
                         "reference_id": "[1]",
+                        "page_idx": 3,
+                        "source_page": 3,
                     },
                     {
                         "content": "\nImage Content Analysis:\nImage Path: /tmp/demo-image.jpg\nCaptions: None\nFootnotes: None\n\nVisual Analysis: A chart image about retrieval pipeline.",
                         "file_path": "demo.pdf",
                         "chunk_id": "chunk-2",
+                        "reference_id": "[1]",
+                        "page_idx": 4,
+                        "source_page": 4,
+                    },
+                    {
+                        "content": "<<PAGE:7>>\nThis page marker is only present in chunk content.",
+                        "file_path": "demo.pdf",
+                        "chunk_id": "chunk-3",
                         "reference_id": "[1]",
                     }
                 ],
@@ -67,12 +77,16 @@ async def main() -> None:
     parsed = json.loads(result)
 
     assert parsed["status"] == "success"
-    assert parsed["counts"]["chunks"] == 2
+    assert parsed["counts"]["chunks"] == 3
     assert parsed["counts"]["image_chunks"] == 1
     assert parsed["evidence"]["entities"][0]["entity_name"] == "RAG"
+    assert parsed["evidence"]["chunks"][0]["page_number"] == 3
+    assert parsed["evidence"]["chunks"][2]["page_number"] == 7
     assert parsed["evidence"]["image_chunks"][0]["is_image"] is True
     assert parsed["evidence"]["image_chunks"][0]["chunk_type"] == "image_analysis"
     assert parsed["evidence"]["image_chunks"][0]["image_path"] == "/tmp/demo-image.jpg"
+    assert parsed["evidence"]["image_chunks"][0]["page_number"] == 4
+    assert parsed["metadata"]["retrieved_pages"] == [3, 4, 7]
 
     print("RETRIEVE_TOOL_TEST: PASS")
     print(result)

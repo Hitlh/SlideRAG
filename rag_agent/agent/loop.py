@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import base64
 import hashlib
 import json
-import mimetypes
-from dataclasses import dataclass, field
+import re
 from datetime import datetime
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -32,8 +31,6 @@ class AgentLoopResult:
 class AgentLoop:
     """Minimal loop that lets the LLM decide when to call RAG tools."""
 
-    _VISUAL_EVIDENCE_PREFIX = "[Retrieved Visual Evidence]"
-
     def __init__(
         self,
         provider: LLMProvider,
@@ -52,6 +49,7 @@ class AgentLoop:
         context: ContextBuilder | None = None,
         tools: ToolRegistry | None = None,
         sessions: SessionManager | None = None,
+        page_image_root: str | Path | None = None,
     ) -> None:
         self.provider = provider
         self.workspace = Path(workspace).expanduser().resolve()
@@ -65,10 +63,9 @@ class AgentLoop:
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.retrieve_config = dict(retrieve_config or {})
-        self.attach_retrieve_images = bool(self.retrieve_config.get("attach_images", True))
-        self.max_retrieve_images = int(self.retrieve_config.get("max_images", 10) or 10)
-        self.max_retrieve_image_bytes = int(
-            self.retrieve_config.get("max_image_bytes", 5 * 1024 * 1024) or 5 * 1024 * 1024
+        self.page_image_root = Path(page_image_root).expanduser().resolve() if page_image_root else None
+        self.max_forced_visual_images = int(
+            self.retrieve_config.get("max_forced_visual_images", 1) or 1
         )
 
         self.context = context or ContextBuilder()
@@ -162,6 +159,9 @@ class AgentLoop:
 
         tools_used: list[str] = []
         tool_calls_count = 0
+        question = self._extract_question_from_messages(initial_messages)
+        force_visual_verification = self._should_force_visual_verification(question)
+        forced_visual_done = False
 
         for iteration in range(1, self.max_iterations + 1):
             response = await self.provider.chat_with_retry(
@@ -183,7 +183,6 @@ class AgentLoop:
             if response.has_tool_calls:
                 tool_call_dicts = [tc.to_openai_tool_call() for tc in response.tool_calls]
                 messages = self.context.add_assistant_message(messages, response.content, tool_call_dicts)
-                visual_items: list[dict[str, Any]] = []
 
                 for tool_call in response.tool_calls:
                     tool_calls_count += 1
@@ -208,16 +207,22 @@ class AgentLoop:
                         result=tool_result,
                     )
 
-                    if self.attach_retrieve_images:
-                        visual_items.extend(self._extract_retrieve_image_items(tool_call.name, tool_result))
-
-                visual_message = self._build_visual_evidence_message(
-                    visual_items,
-                    max_images=self.max_retrieve_images,
-                    max_image_bytes=self.max_retrieve_image_bytes,
-                )
-                if visual_message:
-                    messages.append(visual_message)
+                    if (
+                        tool_call.name == "retrieve"
+                        and force_visual_verification
+                        and not forced_visual_done
+                    ):
+                        auto_visual_results = await self._maybe_run_forced_image_understand(
+                            retrieve_result=tool_result,
+                            question=question,
+                            messages=messages,
+                            iteration=iteration,
+                            tool_calls_count=tool_calls_count,
+                        )
+                        if auto_visual_results is not None:
+                            messages, tool_calls_count, auto_tools_used = auto_visual_results
+                            tools_used.extend(auto_tools_used)
+                            forced_visual_done = True
                 continue
 
             final_answer = response.content or ""
@@ -238,149 +243,510 @@ class AgentLoop:
             messages=messages,
         )
 
-    @staticmethod
-    def _extract_retrieve_image_items(tool_name: str, tool_result: str) -> list[dict[str, Any]]:
-        """Extract image metadata from retrieve JSON while preserving chunk bindings."""
-        if tool_name != "retrieve":
-            return []
-
-        try:
-            payload = json.loads(tool_result)
-        except json.JSONDecodeError:
-            return []
-
-        evidence = payload.get("evidence") if isinstance(payload, dict) else None
-        image_chunks = evidence.get("image_chunks") if isinstance(evidence, dict) else None
-        if not isinstance(image_chunks, list):
-            return []
-
-        items: list[dict[str, Any]] = []
-        for idx, item in enumerate(image_chunks):
-            if not isinstance(item, dict):
-                continue
-
-            image_path = item.get("image_path")
-            if not isinstance(image_path, str) or not image_path.strip():
-                continue
-
-            items.append(
-                {
-                    "visual_id": item.get("visual_id") or f"IMG-{idx + 1}",
-                    "stable_visual_id": item.get("stable_visual_id"),
-                    "image_path": image_path.strip(),
-                    "chunk_id": item.get("chunk_id"),
-                    "reference_id": item.get("reference_id"),
-                    "image_chunk_index": idx,
-                }
-            )
-
-        return items
-
-    @classmethod
-    def _build_visual_evidence_message(
-        cls,
-        image_items: list[dict[str, Any]],
-        max_images: int,
-        max_image_bytes: int,
-    ) -> dict[str, Any] | None:
-        """Build a synthetic multimodal message that binds each image to its image_chunk."""
-        if max_images <= 0 or not image_items:
+    async def _maybe_run_forced_image_understand(
+        self,
+        *,
+        retrieve_result: str,
+        question: str,
+        messages: list[dict[str, Any]],
+        iteration: int,
+        tool_calls_count: int,
+    ) -> tuple[list[dict[str, Any]], int, list[str]] | None:
+        payload = self._parse_tool_json(retrieve_result)
+        if payload.get("status") != "success":
             return None
 
-        content: list[dict[str, Any]] = [
-            {
-                "type": "text",
-                "text": (
-                    f"{cls._VISUAL_EVIDENCE_PREFIX}\n"
-                    "The retrieve tool returned the following images as visual evidence. "
-                    "Each image is preceded by metadata. Match each image to "
-                    "`retrieve.evidence.image_chunks[*]` by `visual_id`, `chunk_id`, "
-                    "`reference_id`, or `image_path`. Do not mix facts across different visual_ids."
-                ),
-            }
-        ]
+        evidence = payload.get("evidence")
+        if not isinstance(evidence, dict):
+            return None
 
-        seen_paths: set[str] = set()
-        attached_count = 0
-        skipped_visual_ids: list[str] = []
+        image_chunks = evidence.get("image_chunks")
+        if not isinstance(image_chunks, list):
+            return None
 
-        for item_index, item in enumerate(image_items):
-            image_path = item.get("image_path")
-            if not isinstance(image_path, str) or not image_path:
-                continue
+        if (
+            not self._is_strong_visual_question(question)
+            and self._retrieval_has_direct_answer_signal(payload=payload, question=question)
+        ):
+            return None
 
-            visual_id = str(item.get("visual_id") or f"IMG-{attached_count + 1}")
-            if image_path in seen_paths:
-                skipped_visual_ids.append(visual_id)
-                continue
-            seen_paths.add(image_path)
+        page_image_chunks = self._build_page_image_chunks_from_retrieval(payload)
+        if self._is_strong_visual_question(question) and page_image_chunks:
+            # Strong layout/chart questions need the complete slide more than OCR crops.
+            image_chunks = [*page_image_chunks, *image_chunks]
+        elif not image_chunks:
+            image_chunks = page_image_chunks
+            if not image_chunks:
+                return None
 
-            data_url = cls._image_path_to_data_url(image_path, max_bytes=max_image_bytes)
-            if not data_url:
-                skipped_visual_ids.append(visual_id)
-                continue
+        selected_chunks = self._select_relevant_image_chunks(
+            image_chunks=image_chunks,
+            question=question,
+            max_chunks=max(1, self.max_forced_visual_images),
+        )
+        if not selected_chunks:
+            return None
 
-            content.append(
-                {
-                    "type": "text",
-                    "text": (
-                        f"visual_id: {visual_id}\n"
-                        f"stable_visual_id: {item.get('stable_visual_id')}\n"
-                        f"chunk_id: {item.get('chunk_id')}\n"
-                        f"reference_id: {item.get('reference_id')}\n"
-                        f"image_path: {image_path}\n"
-                        f"corresponds_to: retrieve.evidence.image_chunks[{item.get('image_chunk_index')}]"
-                    ),
-                }
-            )
-            content.append({"type": "image_url", "image_url": {"url": data_url}})
+        auto_tools_used: list[str] = []
+        image_tool = self.tools.get("image_understand")
+        if image_tool is None:
+            return None
 
-            attached_count += 1
-            if attached_count >= max_images:
-                remaining = image_items[item_index + 1 :]
-                skipped_visual_ids.extend(
-                    str(remaining_item.get("visual_id") or "")
-                    for remaining_item in remaining
-                    if isinstance(remaining_item, dict) and remaining_item.get("visual_id")
-                )
+        for image_index, image_chunk in enumerate(selected_chunks, start=1):
+            if tool_calls_count >= self.max_tool_calls:
                 break
 
-        if attached_count == 0:
+            image_path = str(image_chunk.get("image_path", "")).strip()
+            if not image_path:
+                continue
+
+            page_number = image_chunk.get("page_number") or image_chunk.get("source_page") or image_chunk.get("page_idx")
+            prompt = self._build_forced_visual_prompt(question=question, page_number=page_number)
+            tool_call_id = f"auto-image-understand-{iteration}-{image_index}"
+
+            messages = self.context.add_assistant_message(
+                messages,
+                "Running targeted visual follow-up because retrieved evidence did not directly answer the question.",
+                [
+                    {
+                        "id": tool_call_id,
+                        "type": "function",
+                        "function": {
+                            "name": "image_understand",
+                            "arguments": json.dumps(
+                                {"image_path": image_path, "prompt": prompt},
+                                ensure_ascii=False,
+                            ),
+                        },
+                    }
+                ],
+            )
+            tool_result = await image_tool.execute(image_path=image_path, prompt=prompt)
+            messages = self.context.add_tool_result(
+                messages,
+                tool_call_id=tool_call_id,
+                tool_name="image_understand",
+                result=tool_result,
+            )
+            tool_calls_count += 1
+            auto_tools_used.append("image_understand")
+
+        if not auto_tools_used:
             return None
 
-        if skipped_visual_ids:
-            content.append(
+        return messages, tool_calls_count, auto_tools_used
+
+    def _build_page_image_chunks_from_retrieval(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
+        if self.page_image_root is None:
+            return []
+
+        page_contents: dict[int, list[str]] = {}
+        evidence = payload.get("evidence")
+        if isinstance(evidence, dict):
+            chunks = evidence.get("chunks")
+            if isinstance(chunks, list):
+                for chunk in chunks:
+                    if not isinstance(chunk, dict):
+                        continue
+                    page_number = self._coerce_positive_int(chunk.get("page_number"))
+                    if page_number is None:
+                        continue
+                    content = chunk.get("content")
+                    if not isinstance(content, str) or not content.strip():
+                        continue
+                    page_contents.setdefault(page_number, []).append(content.strip())
+
+        metadata = payload.get("metadata")
+        retrieved_pages = metadata.get("retrieved_pages") if isinstance(metadata, dict) else []
+        if isinstance(retrieved_pages, list):
+            for raw_page in retrieved_pages:
+                page_number = self._coerce_positive_int(raw_page)
+                if page_number is not None:
+                    page_contents.setdefault(page_number, [])
+
+        fallback_chunks: list[dict[str, Any]] = []
+        for page_number, contents in page_contents.items():
+            image_path = self._resolve_page_image_path(page_number)
+            if image_path is None:
+                continue
+
+            retrieved_text = "\n".join(contents)
+            fallback_chunks.append(
                 {
-                    "type": "text",
-                    "text": (
-                        "Not all retrieved images were attached. These visual_ids have only text "
-                        f"evidence in the retrieve JSON or were skipped: {', '.join(skipped_visual_ids)}"
+                    "chunk_type": "page_image",
+                    "is_image": True,
+                    "page_number": page_number,
+                    "image_path": str(image_path),
+                    "content": (
+                        f"Full slide page image for page {page_number}."
+                        f"\nRetrieved text from this page:\n{retrieved_text}"
                     ),
                 }
             )
 
-        return {"role": "user", "content": content}
+        return fallback_chunks
 
     @staticmethod
-    def _image_path_to_data_url(image_path: str, max_bytes: int) -> str | None:
-        path = Path(image_path).expanduser().resolve()
-        if not path.exists() or not path.is_file():
+    def _coerce_positive_int(value: Any) -> int | None:
+        if isinstance(value, bool):
             return None
-
-        if max_bytes > 0 and path.stat().st_size > max_bytes:
-            return None
-
-        mime_type, _ = mimetypes.guess_type(str(path))
-        allowed_mime_types = {"image/jpeg", "image/png", "image/webp", "image/gif"}
-        if mime_type not in allowed_mime_types:
-            return None
-
         try:
-            encoded = base64.b64encode(path.read_bytes()).decode("utf-8")
-        except OSError:
+            number = int(value)
+        except (TypeError, ValueError):
+            return None
+        return number if number > 0 else None
+
+    def _resolve_page_image_path(self, page_number: int) -> Path | None:
+        if self.page_image_root is None:
             return None
 
-        return f"data:{mime_type};base64,{encoded}"
+        direct_candidates = (
+            self.page_image_root / f"page_{page_number:02d}.jpg",
+            self.page_image_root / f"page_{page_number:02d}.jpeg",
+            self.page_image_root / f"page_{page_number:02d}.png",
+        )
+        for candidate in direct_candidates:
+            if candidate.is_file():
+                return candidate
+
+        for candidate in sorted(self.page_image_root.glob(f"page_{page_number:02d}_*")):
+            if candidate.is_file() and candidate.suffix.lower() in {
+                ".jpg",
+                ".jpeg",
+                ".png",
+                ".webp",
+                ".bmp",
+                ".gif",
+                ".tif",
+                ".tiff",
+            }:
+                return candidate
+        return None
+
+    @staticmethod
+    def _extract_question_from_messages(messages: list[dict[str, Any]]) -> str:
+        for message in reversed(messages):
+            if message.get("role") != "user":
+                continue
+            content = message.get("content")
+            if not isinstance(content, str):
+                continue
+            match = re.search(r"Question:\s*(.+)", content, flags=re.IGNORECASE | re.DOTALL)
+            if match:
+                return match.group(1).strip()
+            return content.strip()
+        return ""
+
+    @staticmethod
+    def _should_force_visual_verification(question: str) -> bool:
+        lowered = question.lower()
+        # Force VLM only for questions whose answer depends on visual layout or
+        # reading a named figure. Plain numeric/category comparisons are often
+        # answered more reliably from retrieved OCR/chart text.
+        explicit_visual_markers = (
+            "pictured",
+            "shown",
+            "figure",
+            "image",
+            "photo",
+            "diagram",
+            "chart",
+            "graph",
+            "table",
+            "flow chart",
+            "flowchart",
+            "screenshot",
+            "visual",
+            "illustration",
+            "map",
+        )
+        spatial_or_label_markers = (
+            "above",
+            "below",
+            "left",
+            "right",
+            "under",
+            "over",
+            "next to",
+            "beside",
+            "column",
+            "row",
+            "closest",
+            "farthest",
+            "label",
+            "labeled",
+            "dial",
+            "icon",
+            "color",
+            "colour",
+            "legend",
+            "axis",
+            "arrow",
+            "node",
+            "box",
+        )
+        layout_phrases = (
+            "comes under",
+            "fall under",
+            "falls under",
+            "listed under",
+            "to the left of",
+            "to the right of",
+            "in the column",
+            "in the row",
+            "which treats conditions",
+            "where is",
+            "where are",
+        )
+        if AgentLoop._is_strong_visual_question(question):
+            return True
+
+        return any(
+            re.search(rf"(?<![a-z0-9]){re.escape(marker)}(?![a-z0-9])", lowered)
+            for marker in explicit_visual_markers + spatial_or_label_markers + layout_phrases
+        )
+
+    @classmethod
+    def _is_strong_visual_question(cls, question: str) -> bool:
+        lowered = question.lower()
+        strong_markers = (
+            "flow chart",
+            "flowchart",
+            "directly before",
+            "directly after",
+            "comes before",
+            "comes after",
+            "what follows",
+            "comes between",
+            "comes under",
+            "listed under",
+            "fall under",
+            "falls under",
+            "column to the left",
+            "column to the right",
+            "to the left of",
+            "to the right of",
+            "in the column",
+            "in the row",
+            "which label",
+            "closest to",
+            "arrow",
+            "pictured",
+            "percentage points",
+            "will drop",
+            "drop how many",
+            "dropped how many",
+        )
+        if any(marker in lowered for marker in strong_markers):
+            return True
+
+        # General figure/image questions still need VLM when they ask for a
+        # visual count or identification, but not for plain numeric comparisons.
+        if re.search(r"\b(how many|what|which)\b", lowered) and re.search(
+            r"\b(image|figure|diagram|chart|graph|screenshot)\b", lowered
+        ):
+            return True
+
+        return False
+
+    @classmethod
+    def _retrieval_has_direct_answer_signal(cls, *, payload: dict[str, Any], question: str) -> bool:
+        """Return True when retrieved text already looks sufficient for a concise answer.
+
+        This is intentionally conservative: forced VLM is a rescue path for missing
+        evidence, not a second judge that should override clear OCR/retrieval text.
+        """
+        evidence = payload.get("evidence")
+        if not isinstance(evidence, dict):
+            return False
+
+        chunks: list[dict[str, Any]] = []
+        for key in ("chunks", "image_chunks"):
+            raw_items = evidence.get(key)
+            if isinstance(raw_items, list):
+                chunks.extend(item for item in raw_items if isinstance(item, dict))
+
+        question_tokens = cls._significant_question_tokens(question)
+        if not question_tokens:
+            return False
+
+        relevant_texts: list[str] = []
+        quantitative_question = cls._is_quantitative_question(question)
+        min_overlap = 1 if quantitative_question else min(2, len(question_tokens))
+        for chunk in chunks:
+            content = chunk.get("content")
+            if not isinstance(content, str) or not content.strip():
+                continue
+            lowered = content.lower()
+            overlap = sum(1 for token in question_tokens if token in lowered)
+            if overlap >= min_overlap:
+                relevant_texts.append(content)
+
+        if not relevant_texts:
+            return False
+
+        combined = "\n".join(relevant_texts).lower()
+        if quantitative_question:
+            return cls._contains_numeric_answer_signal(combined)
+
+        # Only skip VLM when retrieval text contains an explicit answer cue, not
+        # merely overlapping topic words. Layout questions are handled before this.
+        return cls._contains_factoid_answer_signal(combined, question_tokens)
+
+    @staticmethod
+    def _significant_question_tokens(question: str) -> set[str]:
+        stopwords = {
+            "about",
+            "according",
+            "after",
+            "answer",
+            "before",
+            "between",
+            "does",
+            "from",
+            "have",
+            "image",
+            "figure",
+            "chart",
+            "graph",
+            "shown",
+            "table",
+            "that",
+            "the",
+            "this",
+            "what",
+            "when",
+            "where",
+            "which",
+            "while",
+            "with",
+            "who",
+            "whose",
+            "will",
+            "would",
+        }
+        return {
+            token
+            for token in re.findall(r"[a-z0-9]+", question.lower())
+            if len(token) >= 3 and token not in stopwords
+        }
+
+    @staticmethod
+    def _contains_factoid_answer_signal(text: str, question_tokens: set[str]) -> bool:
+        answer_cue_patterns = (
+            r"\b(?:is|are|was|were|include|includes|included|called|named|belong(?:s)? to|target(?:s)?)\b",
+            r"\b(?:example of|type of|source of|position of|based in|located in)\b",
+            r"\b(?:consists of|composed of|represented by|associated with)\b",
+        )
+        if not any(re.search(pattern, text) for pattern in answer_cue_patterns):
+            return False
+
+        # A cue without enough question overlap is usually just nearby context.
+        return sum(1 for token in question_tokens if token in text) >= min(2, len(question_tokens))
+
+    @staticmethod
+    def _is_quantitative_question(question: str) -> bool:
+        lowered = question.lower()
+        quantitative_markers = (
+            "how many",
+            "how much",
+            "percentage",
+            "percent",
+            "difference",
+            "more",
+            "less",
+            "greater",
+            "lower",
+            "higher",
+            "highest",
+            "lowest",
+            "most",
+            "least",
+            "average",
+            "total",
+            "increase",
+            "decrease",
+        )
+        return any(marker in lowered for marker in quantitative_markers)
+
+    @staticmethod
+    def _contains_numeric_answer_signal(text: str) -> bool:
+        if re.search(r"\b\d+(?:\.\d+)?\s*(?:%|percent|percentage|mm|cm|m|kv|kwh|hours?|days?|years?)?\b", text):
+            return True
+        number_words = (
+            "zero",
+            "one",
+            "two",
+            "three",
+            "four",
+            "five",
+            "six",
+            "seven",
+            "eight",
+            "nine",
+            "ten",
+            "eleven",
+            "twelve",
+        )
+        return any(re.search(rf"\b{word}\b", text) for word in number_words)
+
+    @staticmethod
+    def _parse_tool_json(raw: str) -> dict[str, Any]:
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    @staticmethod
+    def _select_relevant_image_chunks(
+        image_chunks: list[dict[str, Any]],
+        question: str,
+        max_chunks: int = 1,
+    ) -> list[dict[str, Any]]:
+        question_tokens = AgentLoop._significant_question_tokens(question)
+        scored_chunks: list[tuple[int, dict[str, Any]]] = []
+        for chunk in image_chunks:
+            if not isinstance(chunk, dict):
+                continue
+            image_path = str(chunk.get("image_path", "")).strip()
+            if not image_path:
+                continue
+            haystacks = [
+                str(chunk.get("content", "")),
+                str(chunk.get("file_path", "")),
+                str(chunk.get("page_number", "")),
+                str(chunk.get("source_page", "")),
+                str(chunk.get("page_idx", "")),
+            ]
+            lowered = " ".join(haystacks).lower()
+            score = sum(1 for token in question_tokens if token in lowered)
+            if chunk.get("chunk_type") == "page_image":
+                score += 2
+            scored_chunks.append((score, chunk))
+
+        scored_chunks.sort(key=lambda item: item[0], reverse=True)
+        if not scored_chunks:
+            return []
+
+        best_score = scored_chunks[0][0]
+        if best_score <= 0:
+            return []
+
+        return [chunk for _, chunk in scored_chunks[:max_chunks]]
+
+    @staticmethod
+    def _build_forced_visual_prompt(question: str, page_number: Any) -> str:
+        page_hint = ""
+        if page_number is not None:
+            page_hint = f"Focus on slide page {page_number}. "
+        return (
+            f"{page_hint}"
+            "Answer this question by inspecting the image directly. "
+            "Pay close attention to labels, legends, relative positions, flow arrows, and small text. "
+            "If the image does not clearly answer the question, say what is unclear instead of guessing. "
+            f"Question: {question}"
+        )
 
     @staticmethod
     def _build_session_key(
@@ -430,9 +796,6 @@ class AgentLoop:
             if role == "assistant" and not content and not entry.get("tool_calls"):
                 continue
 
-            if role == "user" and AgentLoop._is_visual_evidence_message(content):
-                continue
-
             if role == "user" and isinstance(content, str) and content.startswith(ContextBuilder._RUNTIME_CONTEXT_TAG):
                 parts = content.split("\n\n", 1)
                 if len(parts) > 1 and parts[1].strip():
@@ -444,13 +807,3 @@ class AgentLoop:
             session.messages.append(entry)
 
         session.updated_at = datetime.now()
-
-    @classmethod
-    def _is_visual_evidence_message(cls, content: Any) -> bool:
-        if not isinstance(content, list) or not content:
-            return False
-        first = content[0]
-        if not isinstance(first, dict):
-            return False
-        text = first.get("text")
-        return isinstance(text, str) and text.startswith(cls._VISUAL_EVIDENCE_PREFIX)

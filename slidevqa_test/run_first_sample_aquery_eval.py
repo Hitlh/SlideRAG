@@ -107,7 +107,7 @@ def record_timing(timings: dict[str, float], name: str, started_at: float) -> No
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run agent-based evaluation on one SlideVQA deck."
+        description="Run direct RAGAnything aquery evaluation on one SlideVQA deck."
     )
     parser.add_argument(
         "--parquet",
@@ -164,22 +164,17 @@ def parse_args() -> argparse.Namespace:
         help="Preprocessed grouped QA payload produced by preprocess_slidevqa_groups.py.",
     )
     parser.add_argument(
-        "--answer-mode",
-        choices=("agent", "aquery"),
-        default=os.getenv("ANSWER_MODE", "agent").strip().lower() or "agent",
-        help=(
-            "Worker QA generation mode (currently ignored in this script). "
-            "Provided for compatibility with dataset runner."
-        ),
+        "--query-mode",
+        type=str,
+        default="hybrid",
+        choices=["local", "global", "hybrid", "naive", "mix", "bypass"],
+        help="RAGAnything/LightRAG query mode for direct aquery answering.",
     )
     parser.add_argument(
-        "--aquery-mode",
-        choices=("local", "global", "hybrid", "naive", "mix", "bypass"),
-        default=os.getenv("AQUERY_MODE", "hybrid").strip().lower() or "hybrid",
-        help=(
-            "LightRAG query mode (currently ignored in this script). "
-            "Provided for compatibility with dataset runner."
-        ),
+        "--vlm-enhanced",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use RAGAnything aquery VLM-enhanced path when image evidence is available.",
     )
     return parser.parse_args()
 
@@ -276,10 +271,12 @@ def select_eval_row(df: pd.DataFrame, deck_name: str, row_index: int) -> pd.Seri
 
 
 async def answer_deck_questions(
-    agent_loop: AgentLoop,
+    engine: RAGAnything,
     deck_qa_items: list[dict[str, Any]],
     *,
     deck_slug: str,
+    query_mode: str,
+    vlm_enhanced: bool,
 ) -> list[dict[str, Any]]:
     qa_results: list[dict[str, Any]] = []
 
@@ -292,19 +289,22 @@ async def answer_deck_questions(
         eval_prompt = (
             "Answer this SlideVQA question using the target slide deck.\n"
             "Requirements:\n"
-            "- Use the retrieve tool before answering.\n"
             "- Put the key answer first, preferably in one short sentence.\n"
             "- Do not restate the question.\n"
             "- Do not add broad background unless it is needed to disambiguate the answer.\n"
             "- If helpful, add at most one brief supporting sentence.\n\n"
             f"Question: {question}"
         )
-        session_key = f"slidevqa_eval:{deck_slug}"
-        agent_result = await agent_loop.process_message(
-            user_message=eval_prompt,
-            channel="slidevqa_eval",
-            chat_id=deck_slug,
-            session_key=session_key,
+        started_at = time.perf_counter()
+        answer = await engine.aquery(
+            eval_prompt,
+            mode=query_mode,
+            vlm_enhanced=vlm_enhanced,
+        )
+        elapsed = time.perf_counter() - started_at
+        print(
+            f"[AQUERY] qa_id={qa_id} mode={query_mode} "
+            f"vlm_enhanced={vlm_enhanced} in {format_duration(elapsed)}"
         )
 
         qa_results.append(
@@ -315,10 +315,10 @@ async def answer_deck_questions(
                 "ground_truth_answer": qa_item.get("answer"),
                 "metadata": qa_item.get("metadata"),
                 "query_result": {
-                    "answer": agent_result.final_answer,
-                    "mode": "agent_hybrid",
-                    "tools_used": agent_result.tools_used,
-                    "iterations": agent_result.iterations,
+                    "answer": answer,
+                    "mode": f"aquery_{query_mode}",
+                    "vlm_enhanced": vlm_enhanced,
+                    "elapsed_seconds": elapsed,
                 },
             }
         )
@@ -347,35 +347,6 @@ def extract_json_object(text: str) -> dict[str, Any] | None:
             return None
 
     return parsed if isinstance(parsed, dict) else None
-
-
-def extract_judge_score_fallback(text: str) -> dict[str, Any] | None:
-    """Best-effort parser for judge replies that ignored the JSON-only contract."""
-    stripped = text.strip()
-    if not stripped:
-        return None
-
-    score_patterns = (
-        r'"score"\s*:\s*([0-9]+(?:\.[0-9]+)?)',
-        r"score\s*(?:is|=|:)\s*([0-9]+(?:\.[0-9]+)?)",
-        r"([0-9]+(?:\.[0-9]+)?)\s*/\s*100",
-    )
-    score_value: float | None = None
-    for pattern in score_patterns:
-        match = re.search(pattern, stripped, flags=re.IGNORECASE)
-        if match:
-            try:
-                score_value = float(match.group(1))
-                break
-            except ValueError:
-                continue
-
-    if score_value is None:
-        return None
-
-    reason_match = re.search(r'"reason"\s*:\s*"([^"]+)"', stripped, flags=re.IGNORECASE | re.DOTALL)
-    reason = reason_match.group(1).strip() if reason_match else stripped[:500]
-    return {"score": score_value, "reason": reason}
 
 
 def coerce_judge_payload(
@@ -478,81 +449,44 @@ async def judge_single_qa_result(
         ground_truth_answer=qa_result.get("ground_truth_answer", ""),
         predicted_answer=predicted_answer,
     )
-    last_raw_content = ""
-    last_finish_reason = ""
-    for attempt in range(1, 3):
-        response = await provider.chat_with_retry(
-            messages=messages,
-            model=judge_model,
-            max_tokens=max_tokens,
-            temperature=0,
-        )
+    response = await provider.chat_with_retry(
+        messages=messages,
+        model=judge_model,
+        max_tokens=max_tokens,
+        temperature=0,
+    )
 
-        last_finish_reason = response.finish_reason
-        if response.finish_reason == "error":
-            return {
-                "score": 0.0,
-                "reason": response.content or "Judge model returned an error.",
-                "judge_model": judge_model,
-                "judge_method": "error",
-                "score_scale": "0-100",
-                "finish_reason": response.finish_reason,
-                "needs_review": True,
-            }
+    if response.finish_reason == "error":
+        return {
+            "score": 0.0,
+            "reason": response.content or "Judge model returned an error.",
+            "judge_model": judge_model,
+            "judge_method": "error",
+            "score_scale": "0-100",
+            "finish_reason": response.finish_reason,
+            "needs_review": True,
+        }
 
-        raw_content = response.content or ""
-        last_raw_content = raw_content
-        parsed = extract_json_object(raw_content)
-        if parsed is not None:
-            judgement = coerce_judge_payload(
-                parsed,
-                judge_model=judge_model,
-                finish_reason=response.finish_reason,
-                raw_content=raw_content,
-            )
-            if attempt > 1:
-                judgement["judge_retry_attempts"] = attempt - 1
-            return judgement
+    raw_content = response.content or ""
+    parsed = extract_json_object(raw_content)
+    if parsed is None:
+        return {
+            "score": 0.0,
+            "reason": "Judge model did not return valid JSON.",
+            "judge_model": judge_model,
+            "judge_method": "parse_error",
+            "score_scale": "0-100",
+            "finish_reason": response.finish_reason,
+            "needs_review": True,
+            "raw_judge_response": raw_content,
+        }
 
-        fallback_payload = extract_judge_score_fallback(raw_content)
-        if fallback_payload is not None:
-            judgement = coerce_judge_payload(
-                fallback_payload,
-                judge_model=judge_model,
-                finish_reason=response.finish_reason,
-                raw_content=raw_content,
-            )
-            judgement["judge_method"] = "llm_fallback_parse"
-            judgement["needs_review"] = True
-            return judgement
-
-        messages = [
-            {
-                "role": "system",
-                "content": "Return only one strict JSON object with numeric score and string reason. No markdown.",
-            },
-            {
-                "role": "user",
-                "content": (
-                    "The previous judge response was not valid JSON. Re-evaluate and return only "
-                    "{\"score\": <0-100>, \"reason\": \"brief explanation\"}.\n\n"
-                    f"Question: {qa_result.get('question', '')}\n"
-                    f"Ground truth answer: {qa_result.get('ground_truth_answer', '')}\n"
-                    f"Predicted answer: {predicted_answer}"
-                ),
-            },
-        ]
-
-    return {
-        "score": 0.0,
-        "reason": "Judge model did not return valid JSON after retry.",
-        "judge_model": judge_model,
-        "judge_method": "parse_error",
-        "score_scale": "0-100",
-        "finish_reason": last_finish_reason,
-        "needs_review": True,
-        "raw_judge_response": last_raw_content,
-    }
+    return coerce_judge_payload(
+        parsed,
+        judge_model=judge_model,
+        finish_reason=response.finish_reason,
+        raw_content=raw_content,
+    )
 
 
 async def judge_qa_results(
@@ -747,12 +681,7 @@ class EvaluationRAGService:
 
         raise RuntimeError(f"Unsupported AGENT_PROVIDER: {agent_provider}")
 
-    def get_agent_loop(
-        self,
-        rag: RAGAnything,
-        workspace: Path,
-        page_image_root: Path | None = None,
-    ) -> AgentLoop:
+    def get_agent_loop(self, rag: RAGAnything, workspace: Path) -> AgentLoop:
         workspace_key = str(workspace.resolve())
         if workspace_key in self.agent_loop_pool:
             return self.agent_loop_pool[workspace_key]
@@ -771,7 +700,6 @@ class EvaluationRAGService:
                 "top_k": get_env_int("RETRIEVE_TOP_K", 20),
                 "chunk_top_k": get_env_int("RETRIEVE_CHUNK_TOP_K", 20),
             },
-            page_image_root=page_image_root,
         )
         self.agent_loop_pool[workspace_key] = agent_loop
         return agent_loop
@@ -975,13 +903,11 @@ async def main() -> None:
 
     stage_started_at = time.perf_counter()
     qa_results = await answer_deck_questions(
-        agent_loop=service.get_agent_loop(
-            engine,
-            run_root / "agent_loop_workspace",
-            page_image_root=source_image_dir,
-        ),
+        engine=engine,
         deck_qa_items=deck_qa_items,
         deck_slug=deck_slug,
+        query_mode=args.query_mode,
+        vlm_enhanced=args.vlm_enhanced,
     )
     record_timing(timings, "answer_deck_questions", stage_started_at)
 
@@ -1017,6 +943,9 @@ async def main() -> None:
     final_result = {
         "deck_name": deck_name,
         "qa_id": qa_id,
+        "eval_method": "aquery",
+        "query_mode": args.query_mode,
+        "vlm_enhanced": args.vlm_enhanced,
         "run_root": str(run_root),
         "deck_cache_dir": str(deck_dir),
         "doc_ref_path": str(doc_ref_path),

@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
+import re
 from typing import Any
 
 from .base import Tool
@@ -115,20 +115,20 @@ class RetrieveTool(Tool):
         references = data.get("references") if isinstance(data.get("references"), list) else []
 
         image_chunks = []
+        retrieved_pages: list[int] = []
         for chunk in chunks:
             if not isinstance(chunk, dict):
                 continue
+            page_number = RetrieveTool._extract_page_number(chunk)
+            if page_number is not None and page_number not in retrieved_pages:
+                retrieved_pages.append(page_number)
             content = chunk.get("content")
             if not isinstance(content, str):
                 continue
             if not RetrieveTool._is_image_analysis_chunk(content):
                 continue
 
-            image_path = RetrieveTool._extract_image_path(content)
-            visual_index = len(image_chunks) + 1
             image_item = {
-                "visual_id": f"IMG-{visual_index}",
-                "stable_visual_id": RetrieveTool._build_stable_visual_id(chunk, image_path, visual_index),
                 "chunk_type": "image_analysis",
                 "is_image": True,
                 "content": content,
@@ -137,7 +137,16 @@ class RetrieveTool(Tool):
                 image_item["chunk_id"] = chunk.get("chunk_id")
             if "reference_id" in chunk:
                 image_item["reference_id"] = chunk.get("reference_id")
+            if "file_path" in chunk:
+                image_item["file_path"] = chunk.get("file_path")
+            if "page_idx" in chunk:
+                image_item["page_idx"] = chunk.get("page_idx")
+            if "source_page" in chunk:
+                image_item["source_page"] = chunk.get("source_page")
+            if page_number is not None:
+                image_item["page_number"] = page_number
 
+            image_path = RetrieveTool._extract_image_path(content)
             if image_path:
                 image_item["image_path"] = image_path
 
@@ -188,7 +197,7 @@ class RetrieveTool(Tool):
                     if isinstance(r, dict)
                 ],
                 "chunks": [
-                    _pick(c, ("content", "chunk_id", "reference_id"))
+                    RetrieveTool._pick_chunk_evidence(c)
                     for c in chunks
                     if isinstance(c, dict)
                 ],
@@ -199,8 +208,23 @@ class RetrieveTool(Tool):
                     if isinstance(ref, dict)
                 ],
             },
-            "metadata": raw.get("metadata", {}),
+            "metadata": {
+                **(raw.get("metadata", {}) if isinstance(raw.get("metadata"), dict) else {}),
+                "retrieved_pages": sorted(retrieved_pages),
+            },
         }
+
+    @staticmethod
+    def _pick_chunk_evidence(chunk: dict[str, Any]) -> dict[str, Any]:
+        result = {
+            key: chunk.get(key)
+            for key in ("content", "chunk_id", "reference_id", "file_path", "page_idx", "source_page")
+            if key in chunk
+        }
+        page_number = RetrieveTool._extract_page_number(chunk)
+        if page_number is not None:
+            result["page_number"] = page_number
+        return result
 
     @staticmethod
     def _is_image_analysis_chunk(content: str) -> bool:
@@ -220,7 +244,21 @@ class RetrieveTool(Tool):
         return None
 
     @staticmethod
-    def _build_stable_visual_id(chunk: dict[str, Any], image_path: str | None, index: int) -> str:
-        basis = str(chunk.get("chunk_id") or image_path or index)
-        digest = hashlib.md5(basis.encode("utf-8")).hexdigest()[:8]
-        return f"IMG-{digest}"
+    def _extract_page_number(item: dict[str, Any]) -> int | None:
+        for key in ("source_page", "page_number", "page_idx"):
+            value = item.get(key)
+            if isinstance(value, bool):
+                continue
+            try:
+                page_number = int(value)
+            except (TypeError, ValueError):
+                continue
+            if page_number > 0:
+                return page_number
+
+        content = item.get("content")
+        if isinstance(content, str):
+            match = re.search(r"<<\s*PAGE\s*:\s*(\d+)\s*>>", content, flags=re.IGNORECASE)
+            if match:
+                return int(match.group(1))
+        return None
