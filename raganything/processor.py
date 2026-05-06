@@ -1283,11 +1283,40 @@ class ProcessorMixin:
             return
 
         page_chunks: List[str] = []
+        tokenizer = getattr(self.lightrag, "tokenizer", None)
+        chunk_token_size = int(getattr(self.lightrag, "chunk_token_size", 1200) or 1200)
+        chunk_overlap_token_size = int(
+            getattr(self.lightrag, "chunk_overlap_token_size", 100) or 0
+        )
         for page_idx in sorted(page_texts.keys()):
             page_text = page_texts[page_idx].strip()
             if not page_text:
                 continue
-            page_chunks.append(f"<<PAGE:{page_idx}>>\n{page_text}")
+            page_marker = f"<<PAGE:{page_idx}>>\n"
+            if tokenizer is None:
+                page_chunks.append(f"{page_marker}{page_text}")
+                continue
+
+            page_tokens = tokenizer.encode(page_text)
+            marker_tokens = len(tokenizer.encode(page_marker))
+            # LightRAG rejects split_by_character_only chunks over chunk_token_size.
+            # Pre-split long pages and repeat the page marker so page mapping survives.
+            body_limit = max(1, chunk_token_size - marker_tokens - 8)
+            if len(page_tokens) <= body_limit:
+                page_chunks.append(f"{page_marker}{page_text}")
+                continue
+
+            overlap = min(max(0, chunk_overlap_token_size), max(0, body_limit - 1))
+            step = max(1, body_limit - overlap)
+            self.logger.warning(
+                "Page %s text has %d tokens; splitting into <=%d-token page chunks",
+                page_idx,
+                len(page_tokens),
+                chunk_token_size,
+            )
+            for start in range(0, len(page_tokens), step):
+                chunk_text = tokenizer.decode(page_tokens[start : start + body_limit])
+                page_chunks.append(f"{page_marker}{chunk_text.strip()}")
 
         if not page_chunks:
             self.logger.warning("分页文本为空，跳过页实体关系构建")
