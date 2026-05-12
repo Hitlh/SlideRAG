@@ -72,6 +72,7 @@ class AgentLoop:
         self.tools = tools or ToolRegistry()
         self.sessions = sessions or SessionManager(self.workspace)
         self.memory = self._build_memory_controller(tokenizer=tokenizer)
+        self._fallback_image_used = False
         if tools is None:
             self._register_default_tools()
 
@@ -159,9 +160,13 @@ class AgentLoop:
 
         tools_used: list[str] = []
         tool_calls_count = 0
+<<<<<<< jason
         question = self._extract_question_from_messages(initial_messages)
         force_visual_verification = self._should_force_visual_verification(question)
         forced_visual_done = False
+=======
+        last_retrieve_images: list[dict[str, Any]] = []
+>>>>>>> local
 
         for iteration in range(1, self.max_iterations + 1):
             response = await self.provider.chat_with_retry(
@@ -207,6 +212,7 @@ class AgentLoop:
                         result=tool_result,
                     )
 
+<<<<<<< jason
                     if (
                         tool_call.name == "retrieve"
                         and force_visual_verification
@@ -223,9 +229,55 @@ class AgentLoop:
                             messages, tool_calls_count, auto_tools_used = auto_visual_results
                             tools_used.extend(auto_tools_used)
                             forced_visual_done = True
+=======
+                    if self.attach_retrieve_images:
+                        visual_items.extend(self._extract_retrieve_image_items(tool_call.name, tool_result))
+
+                if visual_items:
+                    last_retrieve_images = visual_items
+
+                visual_message = self._build_visual_evidence_message(
+                    visual_items,
+                    max_images=self.max_retrieve_images,
+                    max_image_bytes=self.max_retrieve_image_bytes,
+                )
+                if visual_message:
+                    messages.append(visual_message)
+>>>>>>> local
                 continue
 
             final_answer = response.content or ""
+            if await self._should_fallback_to_image_understand(
+                final_answer,
+                last_retrieve_images,
+                messages,
+            ):
+                fallback_prompt = self._extract_question_from_messages(messages)
+                if not fallback_prompt:
+                    fallback_prompt = "Look for evidence in the image to answer the user question."
+
+                for idx, item in enumerate(last_retrieve_images[:2]):
+                    tool_result = await self.tools.execute(
+                        "image_understand",
+                        {"image_path": item.get("image_path", ""), "prompt": fallback_prompt},
+                    )
+                    tools_used.append("image_understand")
+                    messages = self.context.add_tool_result(
+                        messages,
+                        tool_call_id=f"image_understand_fallback_{idx}",
+                        tool_name="image_understand",
+                        result=tool_result,
+                    )
+
+                response = await self.provider.chat_with_retry(
+                    messages=messages,
+                    tools=None,
+                    model=self.model,
+                    max_tokens=self.max_tokens,
+                    temperature=self.temperature,
+                )
+                final_answer = response.content or final_answer
+
             messages = self.context.add_assistant_message(messages, final_answer)
             return AgentLoopResult(
                 final_answer=final_answer,
@@ -331,7 +383,103 @@ class AgentLoop:
             tool_calls_count += 1
             auto_tools_used.append("image_understand")
 
+<<<<<<< jason
         if not auto_tools_used:
+=======
+        return items
+
+    async def _should_fallback_to_image_understand(
+        self,
+        final_answer: str,
+        last_retrieve_images: list[dict[str, Any]],
+        messages: list[dict[str, Any]],
+    ) -> bool:
+        if self._fallback_image_used:
+            return False
+        if not last_retrieve_images:
+            return False
+
+        normalized = (final_answer or "").strip().lower()
+        if not normalized:
+            self._fallback_image_used = True
+            return True
+
+        llm_flag = await self._classify_fallback_with_llm(final_answer, messages)
+        if llm_flag:
+            self._fallback_image_used = True
+            return True
+
+        return False
+
+    async def _classify_fallback_with_llm(
+        self,
+        final_answer: str,
+        messages: list[dict[str, Any]],
+    ) -> bool:
+        question = self._extract_question_from_messages(messages)
+        if not question:
+            return False
+
+        system_prompt = (
+            "You are a strict classifier. Decide if the assistant answer says the document did not "
+            "mention/provide the needed information (refusal/insufficient evidence). "
+            "Return only JSON: {\"fallback\": true|false}."
+        )
+        user_prompt = (
+            "Question: " + question + "\n"
+            "Answer: " + (final_answer or "") + "\n\n"
+            "If the answer indicates missing/insufficient evidence or that the document does not "
+            "contain the required info, set fallback=true. Otherwise false."
+        )
+
+        try:
+            response = await self.provider.chat_with_retry(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                tools=None,
+                model="gpt-4o",
+                max_tokens=20,
+                temperature=0,
+            )
+        except Exception:
+            return False
+
+        content = (response.content or "").strip()
+        try:
+            payload = json.loads(content)
+        except json.JSONDecodeError:
+            return False
+
+        return bool(payload.get("fallback"))
+
+    @staticmethod
+    def _extract_question_from_messages(messages: list[dict[str, Any]]) -> str:
+        for message in reversed(messages):
+            if message.get("role") != "user":
+                continue
+            content = message.get("content")
+            if not isinstance(content, str):
+                continue
+            parts = content.split("\n\n", 1)
+            candidate = parts[-1].strip()
+            for line in candidate.splitlines():
+                if line.strip().lower().startswith("question:"):
+                    return line.split(":", 1)[1].strip()
+            return candidate
+        return ""
+
+    @classmethod
+    def _build_visual_evidence_message(
+        cls,
+        image_items: list[dict[str, Any]],
+        max_images: int,
+        max_image_bytes: int,
+    ) -> dict[str, Any] | None:
+        """Build a synthetic multimodal message that binds each image to its image_chunk."""
+        if max_images <= 0 or not image_items:
+>>>>>>> local
             return None
 
         return messages, tool_calls_count, auto_tools_used

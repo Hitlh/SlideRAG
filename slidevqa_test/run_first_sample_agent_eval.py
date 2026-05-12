@@ -247,6 +247,113 @@ def remap_page_indices(content_list: list[dict[str, Any]], page_number: int) -> 
     return remapped
 
 
+def normalize_evidence_pages(value: Any) -> list[int]:
+    pages: set[int] = set()
+
+    def add_page(page: int) -> None:
+        if page > 0:
+            pages.add(page)
+
+    def parse_str(text: str) -> None:
+        for start, end in re.findall(r"(\d+)\s*(?:-|~|to)\s*(\d+)", text, flags=re.IGNORECASE):
+            start_num = int(start)
+            end_num = int(end)
+            if start_num <= end_num:
+                for page in range(start_num, end_num + 1):
+                    add_page(page)
+            else:
+                for page in range(end_num, start_num + 1):
+                    add_page(page)
+        for num in re.findall(r"\d+", text):
+            add_page(int(num))
+
+    if value is None:
+        return []
+    if isinstance(value, (int, float)):
+        add_page(int(value))
+    elif isinstance(value, str):
+        parse_str(value)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            if isinstance(item, (int, float)):
+                add_page(int(item))
+            elif isinstance(item, str):
+                parse_str(item)
+    return sorted(pages)
+
+
+def extract_retrieve_chunk_stats_from_payload(
+    payload: dict[str, Any],
+    evidence_pages: set[int],
+) -> tuple[int, int, set[int]]:
+    total_chunks = 0
+    matched_chunks = 0
+    retrieved_pages: set[int] = set()
+    evidence = payload.get("evidence") if isinstance(payload, dict) else None
+    if not isinstance(evidence, dict):
+        return total_chunks, matched_chunks, retrieved_pages
+
+    for chunk in evidence.get("chunks", []) or []:
+        if not isinstance(chunk, dict):
+            continue
+        total_chunks += 1
+        content = chunk.get("content")
+        if not isinstance(content, str):
+            continue
+        chunk_pages = {
+            int(match.group(1))
+            for match in re.finditer(r"<<PAGE:(\d+)>>", content, flags=re.IGNORECASE)
+        }
+        retrieved_pages.update(chunk_pages)
+        if evidence_pages and chunk_pages & evidence_pages:
+            matched_chunks += 1
+
+    for image_item in evidence.get("image_chunks", []) or []:
+        if not isinstance(image_item, dict):
+            continue
+        total_chunks += 1
+        image_path = image_item.get("image_path")
+        if not isinstance(image_path, str):
+            continue
+        match = re.search(r"page_(\d+)", image_path, flags=re.IGNORECASE)
+        if match:
+            page_num = int(match.group(1))
+            retrieved_pages.add(page_num)
+            if evidence_pages and page_num in evidence_pages:
+                matched_chunks += 1
+
+    return total_chunks, matched_chunks, retrieved_pages
+
+
+def extract_retrieve_chunk_stats_from_messages(
+    messages: list[dict[str, Any]],
+    evidence_pages: set[int],
+) -> tuple[int, int, list[int]]:
+    total_chunks = 0
+    matched_chunks = 0
+    retrieved_pages: set[int] = set()
+    for msg in messages:
+        if msg.get("role") != "tool":
+            continue
+        if msg.get("name") != "retrieve":
+            continue
+        content = msg.get("content")
+        if not isinstance(content, str):
+            continue
+        try:
+            payload = json.loads(content)
+        except json.JSONDecodeError:
+            continue
+        chunk_total, chunk_matched, chunk_pages = extract_retrieve_chunk_stats_from_payload(
+            payload, evidence_pages
+        )
+        total_chunks += chunk_total
+        matched_chunks += chunk_matched
+        retrieved_pages.update(chunk_pages)
+
+    return total_chunks, matched_chunks, sorted(retrieved_pages)
+
+
 def find_deck_group(grouped_payload: dict[str, Any], deck_name: str) -> dict[str, Any]:
     decks = grouped_payload.get("decks")
     if not isinstance(decks, list):
@@ -307,6 +414,18 @@ async def answer_deck_questions(
             session_key=session_key,
         )
 
+        expected_pages = normalize_evidence_pages(
+            (qa_item.get("metadata") or {}).get("evidence_pages")
+        )
+        evidence_set = set(expected_pages)
+        total_chunks, matched_chunks, retrieved_pages = extract_retrieve_chunk_stats_from_messages(
+            agent_result.messages,
+            evidence_set,
+        )
+        recall_rate_pct = None
+        if evidence_set and total_chunks:
+            recall_rate_pct = (matched_chunks / total_chunks) * 100.0
+
         qa_results.append(
             {
                 "row_index": qa_item.get("row_index"),
@@ -319,6 +438,13 @@ async def answer_deck_questions(
                     "mode": "agent_hybrid",
                     "tools_used": agent_result.tools_used,
                     "iterations": agent_result.iterations,
+                },
+                "retrieval_recall": {
+                    "expected_pages": expected_pages,
+                    "retrieved_pages": retrieved_pages,
+                    "total_chunks": total_chunks,
+                    "matched_chunks": matched_chunks,
+                    "rate_pct": recall_rate_pct,
                 },
             }
         )
@@ -1034,6 +1160,35 @@ async def main() -> None:
     }
     if llm_judgement_summary is not None:
         final_result["llm_judgement_summary"] = llm_judgement_summary
+
+    recall_items = [
+        item.get("retrieval_recall")
+        for item in qa_results
+        if isinstance(item.get("retrieval_recall"), dict)
+    ]
+    recall_items = [item for item in recall_items if item]
+    retrieval_recall_summary = None
+    if recall_items:
+        total_chunks = 0
+        matched_chunks = 0
+        for item in recall_items:
+            chunk_total = item.get("total_chunks")
+            chunk_matched = item.get("matched_chunks")
+            if chunk_total is None or chunk_matched is None:
+                continue
+            try:
+                total_chunks += int(chunk_total)
+                matched_chunks += int(chunk_matched)
+            except (TypeError, ValueError):
+                continue
+        if total_chunks:
+            retrieval_recall_summary = {
+                "total_chunks": total_chunks,
+                "matched_chunks": matched_chunks,
+                "rate_pct": (matched_chunks / total_chunks) * 100.0,
+            }
+        if retrieval_recall_summary is not None:
+            final_result["retrieval_recall_summary"] = retrieval_recall_summary
 
     save_json(results_root / "result.json", final_result)
     if args.result_json is not None:

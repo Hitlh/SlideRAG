@@ -284,6 +284,8 @@ def write_summary(run_dir: Path, manifest: dict[str, Any]) -> dict[str, Any]:
     total_qa = 0
     judged = 0
     total_score = 0.0
+    recall_total_chunks = 0
+    recall_matched_chunks = 0
     for entry in entries:
         result_path = Path(str(entry.get("result_path", "")))
         payload = load_json(result_path)
@@ -296,6 +298,24 @@ def write_summary(run_dir: Path, manifest: dict[str, Any]) -> dict[str, Any]:
         if isinstance(judgement, dict):
             judged += int(judgement.get("total", 0) or 0)
             total_score += float(judgement.get("total_score", 0.0) or 0.0)
+        recall_summary = payload.get("retrieval_recall_summary")
+        if isinstance(recall_summary, dict):
+            recall_total_chunks += int(recall_summary.get("total_chunks", 0) or 0)
+            recall_matched_chunks += int(recall_summary.get("matched_chunks", 0) or 0)
+        elif isinstance(qa_results, list):
+            for qa_item in qa_results:
+                recall = qa_item.get("retrieval_recall")
+                if not isinstance(recall, dict):
+                    continue
+                chunk_total = recall.get("total_chunks")
+                chunk_matched = recall.get("matched_chunks")
+                if chunk_total is None or chunk_matched is None:
+                    continue
+                try:
+                    recall_total_chunks += int(chunk_total)
+                    recall_matched_chunks += int(chunk_matched)
+                except (TypeError, ValueError):
+                    continue
 
     summary = {
         "run_id": manifest.get("run_id"),
@@ -311,6 +331,12 @@ def write_summary(run_dir: Path, manifest: dict[str, Any]) -> dict[str, Any]:
         "average_score": total_score / judged if judged else None,
         "score_scale": "0-100",
     }
+    if recall_total_chunks:
+        summary["retrieval_recall"] = {
+            "total_chunks": recall_total_chunks,
+            "matched_chunks": recall_matched_chunks,
+            "rate_pct": (recall_matched_chunks / recall_total_chunks) * 100.0,
+        }
     save_json(run_dir / "summary.json", summary)
     return summary
 
