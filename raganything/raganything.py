@@ -34,6 +34,7 @@ from raganything.processor import ProcessorMixin
 from raganything.batch import BatchMixin
 from raganything.utils import get_processor_supports
 from raganything.parser import MineruParser, DoclingParser
+from raganything.domain_prompts import configure_extraction_profile
 
 # Import specialized processors
 from raganything.modalprocessors import (
@@ -251,6 +252,10 @@ class RAGAnything(QueryMixin, ProcessorMixin, BatchMixin):
                 self._parser_installation_checked = True
                 self.logger.info(f"Parser '{self.config.parser}' installation verified")
 
+            addon_overrides = configure_extraction_profile(
+                getattr(self.config, "extraction_profile", "default")
+            )
+
             if self.lightrag is not None:
                 # LightRAG was pre-provided, but we need to ensure it's properly initialized
                 # Inherit model functions from LightRAG if not explicitly provided
@@ -360,6 +365,11 @@ class RAGAnything(QueryMixin, ProcessorMixin, BatchMixin):
 
             # Merge user-provided lightrag_kwargs, which can override defaults
             lightrag_params.update(self.lightrag_kwargs)
+
+            if addon_overrides:
+                addon_params = dict(lightrag_params.get("addon_params", {}))
+                addon_params.update(addon_overrides)
+                lightrag_params["addon_params"] = addon_params
 
             # Log the parameters being used for initialization (excluding sensitive data)
             log_params = {

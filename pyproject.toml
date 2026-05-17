@@ -23,11 +23,12 @@ classifiers = [
 dependencies = [
     "huggingface_hub",
     "lightrag-hku",
-    "mineru[core]==3.0.0",
+    "mineru[core]",
     "tqdm",
     "anthropic",
     "openai",
     "streamlit",
+    "rich",
     "loguru",
     "Pillow>=10.0.0",
     "reportlab>=4.0.0",

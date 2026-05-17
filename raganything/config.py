@@ -29,6 +29,11 @@ class RAGAnythingConfig:
     parser: str = field(default=get_env_value("PARSER", "mineru", str))
     """Parser selection: 'mineru' or 'docling'."""
 
+    extraction_profile: str = field(
+        default=get_env_value("EXTRACTION_PROFILE", "default", str)
+    )
+    """Knowledge extraction profile. Use 'weapon_equipment' for the equipment R&D concept graph."""
+
     display_content_stats: bool = field(
         default=get_env_value("DISPLAY_CONTENT_STATS", True, bool)
     )

@@ -46,6 +46,7 @@ EMBEDDING_MAX_TOKEN_SIZE = get_env_int("EMBEDDING_MAX_TOKEN_SIZE", 8192)
 
 PARSER = get_env_str("PARSER", "mineru")
 PARSE_METHOD = get_env_str("PARSE_METHOD", "auto")
+EXTRACTION_PROFILE = get_env_str("EXTRACTION_PROFILE", "default")
 
 ENABLE_IMAGE_PROCESSING = get_env_bool("ENABLE_IMAGE_PROCESSING", True)
 ENABLE_TABLE_PROCESSING = get_env_bool("ENABLE_TABLE_PROCESSING", True)
@@ -123,6 +124,7 @@ class RAGService:
             working_dir=working_dir,
             parser=PARSER,
             parse_method=PARSE_METHOD,
+            extraction_profile=EXTRACTION_PROFILE,
             enable_image_processing=ENABLE_IMAGE_PROCESSING,
             enable_table_processing=ENABLE_TABLE_PROCESSING,
             enable_equation_processing=ENABLE_EQUATION_PROCESSING,

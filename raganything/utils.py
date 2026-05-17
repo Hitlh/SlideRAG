@@ -30,7 +30,7 @@ def separate_content(
     page_texts: Dict[int, List[str]] = {}
 
     text_like_types = {"text", "expanded_text"}
-    passthrough_text_types = {"header", "footer", "page_number"}
+    passthrough_text_types = {"header", "footer", "page_number","page_footnote","ref_text"}
 
     for item in content_list:
         content_type = item.get("type", "text")
@@ -70,7 +70,7 @@ def separate_content(
                         page_texts.setdefault(page_key, []).append(clean_text)
                     except (ValueError, TypeError):
                         pass
-        elif content_type == "list" and item.get("sub_type") == "text":
+        elif content_type == "list" and (item.get("sub_type") == "text" or item.get("sub_type") == "ref_text"):
             # Treat list of text items as text content
             li = item.get("list_items", [])
             if isinstance(li, list) and li:
